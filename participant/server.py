@@ -40,10 +40,10 @@ def receive_message():
     """
     Receive a message from coordinator.
     
-    This is how coordinator talks to participant.
-    For now, just acknowledge receipt.
-    Later we'll add voting logic here.
+    Now handles different message types and responds appropriately.
     """
+    global participant_state_manager
+    
     data = request.get_json()
     
     # Convert JSON to Message object
@@ -64,14 +64,197 @@ def receive_message():
         transaction_id=message.transaction_id
     )
     
-    # For now, just acknowledge
-    # Later we'll add logic to handle different message types
+    # Check if we have state manager for this transaction
+    if participant_state_manager is None:
+        logger.error(
+            "no_state_manager",
+            participant_id=participant_id,
+            transaction_id=message.transaction_id
+        )
+        return jsonify({
+            "status": "error",
+            "message": "Participant not initialized with transaction"
+        }), 400
+    
+    # Handle different message types
+    response_message = None
+    
+    if message.message_type == MessageType.CAN_COMMIT:
+        # Phase 1: Coordinator asking if we can commit
+        response_message = handle_can_commit(message)
+    
+    elif message.message_type == MessageType.PRE_COMMIT:
+        # Phase 2: Coordinator telling us to prepare
+        response_message = handle_pre_commit(message)
+    
+    elif message.message_type == MessageType.DO_COMMIT:
+        # Phase 3: Coordinator telling us to commit
+        response_message = handle_do_commit(message)
+    
+    elif message.message_type == MessageType.ABORT:
+        # Coordinator telling us to abort
+        response_message = handle_abort(message)
+    
+    else:
+        logger.warning(
+            "unknown_message_type",
+            message_type=message.message_type.value
+        )
+        return jsonify({
+            "status": "error",
+            "message": f"Unknown message type: {message.message_type.value}"
+        }), 400
+    
+    # Return response
     return jsonify({
         "status": "success",
         "participant_id": participant_id,
-        "message": f"Message {message.message_type.value} received",
-        "transaction_id": message.transaction_id
+        "response": response_message.to_dict() if response_message else None,
+        "current_state": participant_state_manager.get_state().value
     }), 200
+
+
+def handle_can_commit(message: Message) -> Message:
+    """
+    Handle CAN_COMMIT message from coordinator.
+    
+    Decision logic: For now, always vote YES.
+    Later we can add conditions (e.g., check resources, random failures).
+    """
+    # Simple decision: always YES for now
+    vote = MessageType.YES
+    
+    # Transition to READY state (voted YES)
+    success = participant_state_manager.transition_to(
+        ParticipantState.READY,
+        reason="voted YES to CAN_COMMIT"
+    )
+    
+    if not success:
+        # If transition failed, vote NO instead
+        vote = MessageType.NO
+        participant_state_manager.transition_to(
+            ParticipantState.ABORT,
+            reason="invalid state transition, voting NO"
+        )
+    
+    # Create response message
+    response = Message(
+        transaction_id=message.transaction_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=vote,
+        state=participant_state_manager.get_state().value
+    )
+    
+    logger.info(
+        "voted",
+        participant_id=participant_id,
+        vote=vote.value,
+        new_state=participant_state_manager.get_state().value
+    )
+    
+    return response
+
+
+def handle_pre_commit(message: Message) -> Message:
+    """
+    Handle PRE_COMMIT message from coordinator.
+    
+    This is Phase 2 - prepare to commit.
+    """
+    # Transition to PRE_COMMIT state
+    success = participant_state_manager.transition_to(
+        ParticipantState.PRE_COMMIT,
+        reason="received PRE_COMMIT from coordinator"
+    )
+    
+    if not success:
+        logger.error(
+            "pre_commit_failed",
+            participant_id=participant_id,
+            current_state=participant_state_manager.get_state().value
+        )
+    
+    # Send ACK back to coordinator
+    response = Message(
+        transaction_id=message.transaction_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=participant_state_manager.get_state().value
+    )
+    
+    return response
+
+
+def handle_do_commit(message: Message) -> Message:
+    """
+    Handle DO_COMMIT message from coordinator.
+    
+    This is Phase 3 - final commit.
+    """
+    # Transition to COMMIT state
+    success = participant_state_manager.transition_to(
+        ParticipantState.COMMIT,
+        reason="received DO_COMMIT from coordinator"
+    )
+    
+    if not success:
+        logger.error(
+            "commit_failed",
+            participant_id=participant_id,
+            current_state=participant_state_manager.get_state().value
+        )
+    
+    # Send COMMITTED confirmation
+    response = Message(
+        transaction_id=message.transaction_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=participant_state_manager.get_state().value,
+        data={"committed": True}
+    )
+    
+    logger.info(
+        "transaction_committed",
+        participant_id=participant_id,
+        transaction_id=message.transaction_id
+    )
+    
+    return response
+
+
+def handle_abort(message: Message) -> Message:
+    """
+    Handle ABORT message from coordinator.
+    
+    Abort the transaction.
+    """
+    # Transition to ABORT state
+    participant_state_manager.transition_to(
+        ParticipantState.ABORT,
+        reason="received ABORT from coordinator"
+    )
+    
+    # Send ACK back
+    response = Message(
+        transaction_id=message.transaction_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=participant_state_manager.get_state().value,
+        data={"aborted": True}
+    )
+    
+    logger.info(
+        "transaction_aborted",
+        participant_id=participant_id,
+        transaction_id=message.transaction_id
+    )
+    
+    return response
 
 
 @app.route('/state', methods=['GET'])
