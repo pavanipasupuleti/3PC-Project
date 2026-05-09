@@ -33,16 +33,26 @@ Implementation of Three-Phase Commit protocol with partition simulation and non-
 ## Architecture Diagrams
 
 ### State Machines
-- [Coordinator State Machine](docs/diagrams/coordinator-state-machine.png)
-- [Participant State Machine](docs/diagrams/participant-state-machine.png)
+- [Coordinator State]
+<img width="2650" height="3230" alt="coordinator-state-machine" src="https://github.com/user-attachments/assets/4e41701d-9ce4-415b-82e2-ee785e0e841f" />
+- [Participant State]
+<img width="3345" height="3435" alt="participant-state-machine" src="https://github.com/user-attachments/assets/c7fa2118-d6be-4ac6-883d-6d91ebf78206" />
 
 ### Protocol Flows
-- [Successful Commit Flow](docs/diagrams/successful-commit-flow.png)
-- [Abort Flow](docs/diagrams/abort-flow.png)
-- [Non-Blocking Recovery](docs/diagrams/non-blocking-recovery.png) - **Key demonstration**
+- [Successful Commit Flow]
+- <img width="4685" height="7040" alt="successful-commit-flow" src="https://github.com/user-attachments/assets/77d26fe4-d965-423c-a626-dce79b6623f0" />
 
-### Data Structures
-- [Message Format](docs/diagrams/message-format.png)
+- [Abort Flow]
+<img width="4330" height="5940" alt="abort-flow" src="https://github.com/user-attachments/assets/1ff0de00-ead5-43d5-bd43-23f397ddcb69" />
+
+- [Non-Blocking Recovery]
+- <img width="4542" height="8191" alt="non-blocking-recovery" src="https://github.com/user-attachments/assets/7759717c-afbf-44ad-9cb1-af7749070629" />
+
+- **Key demonstration**
+
+- [Message Format]
+- <img width="2142" height="3400" alt="message-format" src="https://github.com/user-attachments/assets/50ac8b22-947d-49d3-9fe4-317ed5d1f48a" />
+
 
 ## Key Concept: Non-Blocking Property
 
