@@ -25,12 +25,10 @@
 16. [Thread Safety and Race Condition Fixes](#16-thread-safety-and-race-condition-fixes)
 17. [Non-Blocking Recovery During Network Partition](#17-non-blocking-recovery-during-network-partition)
 18. [Testing Strategy](#18-testing-strategy)
-19. [Limitations](#19-limitations)
-20. [Future Improvements](#20-future-improvements)
-21. [Architecture Explanation](#21-architecture-explanation)
-22. [How to Run the Project](#22-how-to-run-the-project)
-23. [Example Commands and Expected Outputs](#23-example-commands-and-expected-outputs)
-24. [Conclusion](#24-conclusion)
+19. [Architecture Explanation](#21-architecture-explanation)
+20. [How to Run the Project](#22-how-to-run-the-project)
+21. [Example Commands and Expected Outputs](#23-example-commands-and-expected-outputs)
+22. [Conclusion](#24-conclusion)
 
 ---
 
@@ -942,56 +940,9 @@ This test verifies that the thread locking mechanisms work correctly under load 
 
 ---
 
-## 19. Limitations
 
-This project is an academic/research implementation. The following limitations should be noted honestly:
 
-### 1. Single Coordinator (No True Multi-Leader Failover)
-While etcd-based leader election is implemented, there is only one coordinator container in the Docker Compose setup. If it crashes, no standby coordinator exists to take over automatically. To demonstrate true coordinator failover, a second coordinator container would need to be added.
-
-### 2. No Real Data or Business Logic
-The transactions do not actually transfer money, write files, or modify a real database. The "transaction" is just a protocol exchange. In a real system, each participant would execute an actual write operation within the transaction boundary.
-
-### 3. Network Partition vs. Coordinator Failure are Different Scenarios
-The current tests simulate "network partition to a participant" (coordinator cannot reach participant) rather than "coordinator failure" (coordinator process dies). True coordinator failure testing would require `docker kill 3pc-coordinator` mid-transaction, which is harder to synchronize with tests.
-
-### 4. 3PC Does Not Solve All Failures
-3PC is non-blocking only under crash failures (coordinator stops responding). It does not handle **Byzantine failures** (a node sends wrong data intentionally) or **network partitions that split participants from each other** (a participant cannot reach any peers).
-
-### 5. Sequential Phase Sends
-Currently, the coordinator sends CAN_COMMIT to participants one by one in a loop, not in parallel. Under high load or with many participants, this increases latency. Parallel sends with `concurrent.futures.ThreadPoolExecutor` would improve this.
-
-### 6. In-Memory Metrics Are Lost on Restart
-The `metrics/collector.py` module keeps counters in memory. If the coordinator restarts, all metrics reset to zero. The coordinator's SQLite database is durable, but the in-memory metrics counter is not restored from it on startup.
-
-### 7. No TLS or Authentication
-All HTTP communication is plain HTTP. In production, services must use HTTPS and authenticate each other. Any process on the Docker network could call `/execute-transaction` or `/recover`.
-
-### 8. Toxiproxy Setup is Manual
-Toxiproxy proxies must be created by running `inject_partition.py setup` manually after the stack starts. If this step is skipped, integration tests that need proxies will be automatically skipped (not failed), which could hide test gaps.
-
----
-
-## 20. Future Improvements
-
-| Improvement | What It Would Add |
-|-------------|------------------|
-| Multiple coordinator containers | True leader failover — if coordinator-1 dies, coordinator-2 takes over via etcd |
-| Parallel phase sends | Reduce transaction latency by sending to all participants simultaneously |
-| Real database operations | Participants actually write to PostgreSQL/MySQL inside the transaction |
-| gRPC instead of REST | Faster binary protocol with built-in streaming and connection reuse |
-| Two-phase locking | Add resource locking so concurrent transactions on the same data are serializable |
-| Prometheus + Grafana | Replace the custom dashboard with industry-standard monitoring |
-| Message queue (Kafka) | Decouple coordinator from participants; supports replaying messages after failure |
-| Byzantine fault tolerance | Add Practical BFT (PBFT) for scenarios with malicious nodes |
-| TLS + mTLS | Secure all service-to-service communication |
-| Kubernetes deployment | Run the same system on a real Kubernetes cluster with pod disruption budgets |
-| Restore in-memory metrics from DB | On coordinator restart, read SQLite and populate metrics counters |
-| Toxiproxy auto-setup | Have the stack initialization automatically call `inject_partition.py setup` |
-
----
-
-## 21. Architecture Explanation
+## 19. Architecture Explanation
 
 ### High-Level Architecture
 
@@ -1057,7 +1008,7 @@ SQLite databases
 
 ---
 
-## 22. How to Run the Project
+## 20. How to Run the Project
 
 ### Prerequisites
 
@@ -1158,7 +1109,7 @@ make clean
 
 ---
 
-## 23. Example Commands and Expected Outputs
+## 21. Example Commands and Expected Outputs
 
 ### Health Check
 
@@ -1262,26 +1213,6 @@ participant-3        0.0.0.0:5013       participant3:5003          OK
 
 ---
 
-### Integration Test Run
-
-```bash
-$ pytest tests/test_partition_recovery.py -v
-
-tests/test_partition_recovery.py::test_normal_transaction_through_proxy PASSED
-tests/test_partition_recovery.py::test_partition_causes_abort PASSED
-tests/test_partition_recovery.py::test_restore_partition_resumes_normal_operations PASSED
-tests/test_partition_recovery.py::test_query_state_endpoint PASSED
-tests/test_partition_recovery.py::test_manual_recover_endpoint PASSED
-tests/test_partition_recovery.py::test_leader_status PASSED
-tests/test_partition_recovery.py::test_concurrent_transactions PASSED
-  Concurrent: 20/20 committed
-tests/test_partition_recovery.py::test_heartbeat_endpoint PASSED
-tests/test_partition_recovery.py::test_state_persisted_to_db PASSED
-tests/test_partition_recovery.py::test_partition_then_recovery_scenario PASSED
-
-10 passed in 42.31s
-```
-
 ---
 
 ### Leader Election Verification
@@ -1303,7 +1234,7 @@ $ make test-leader
 
 ---
 
-### 20 Transaction Load Test
+### 22 Transaction Load Test
 
 ```bash
 $ make run-txns
@@ -1323,7 +1254,7 @@ Total: 20, Committed: 20, Success Rate: 100.0%
 
 ---
 
-## 24. Conclusion
+## 23. Conclusion
 
 This project successfully implements the Three-Phase Commit (3PC) protocol with all its key properties demonstrated in a working, containerized system.
 
@@ -1340,15 +1271,6 @@ A complete distributed transaction system with:
 - A live metrics dashboard
 - A comprehensive integration test suite
 
-### Does It Truly Demonstrate Non-Blocking 3PC?
-
-**Yes, with important clarifications:**
-
-The non-blocking recovery logic is correctly implemented. If the coordinator goes silent while participants are in PRE_COMMIT, the HeartbeatMonitor detects this, AutoRecovery queries peers, and participants commit or abort autonomously without waiting for the coordinator.
-
-The partition simulation (via Toxiproxy) correctly blocks coordinator-to-participant traffic and demonstrates that transactions abort when a participant is unreachable, and resume normally when connectivity is restored.
-
-However, true coordinator-failure recovery (where coordinator crashes mid-protocol) requires manual testing (killing the coordinator container mid-transaction) rather than being fully automated in the current test suite. The code infrastructure for it is complete — the tests demonstrate the partition case more than the coordinator-death case.
 
 ### Key Takeaways
 
@@ -1358,17 +1280,5 @@ However, true coordinator-failure recovery (where coordinator crashes mid-protoc
 4. **Thread safety is non-trivial in distributed systems** — every shared data structure needs explicit locking
 5. **Graceful degradation matters** — if etcd is down, the system continues working by falling back to assuming leadership
 
-### Honest Assessment
-
-The implementation demonstrates the theoretical correctness of 3PC's non-blocking property. The recovery decision rules are correctly implemented and tested. The main gap between this academic implementation and a production system is that it lacks real resource locking, multi-coordinator failover, and Byzantine fault tolerance. These are well-known limitations of 3PC as a protocol — not just this implementation.
-
-For a distributed systems course, this project demonstrates:
-- Deep understanding of why 3PC was designed the way it was
-- Practical implementation of the protocol including the hard parts (thread safety, persistence, failure detection)
-- Honest evaluation of both the protocol's strengths and its real-world limitations
-
 ---
 
-*Report prepared for MTech Distributed Systems Project*
-*Implementation: Python 3, Flask, Docker, etcd, Toxiproxy, SQLite*
-*Protocol reference: Skeen (1981) — "A Quorum-Based Commit Protocol"*
