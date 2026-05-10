@@ -6,6 +6,7 @@ This is the participant's "mouth and ears" - handles HTTP communication.
 
 from flask import Flask, request, jsonify
 import structlog
+import requests
 from participant.state import ParticipantStateManager, ParticipantState
 from coordinator.messages import Message, MessageType
 
@@ -18,6 +19,112 @@ app = Flask(__name__)
 # Will be set when server starts
 participant_id = None
 participant_state_manager = None
+
+
+def attempt_recovery(peer_urls: list) -> dict:
+    """
+    Attempt to recover from coordinator failure using peer consensus.
+    
+    This is the core of 3PC's non-blocking property!
+    
+    Recovery rules:
+    1. Can only recover if in PRE_COMMIT state
+    2. Query all peer participants for their states
+    3. If ALL peers in PRE_COMMIT → safe to COMMIT
+    4. Otherwise → ABORT
+    
+    Args:
+        peer_urls: List of peer participant URLs to query
+        
+    Returns:
+        dict with recovery decision and details
+    """
+    global participant_state_manager
+    
+    # Can only attempt recovery from PRE_COMMIT state
+    if not participant_state_manager.can_commit_without_coordinator():
+        current_state = participant_state_manager.get_state().value
+        logger.warning("recovery_not_possible",
+                      participant_id=participant_id,
+                      current_state=current_state,
+                      reason="not in PRE_COMMIT state")
+        return {
+            "can_recover": False,
+            "reason": f"Cannot recover from state {current_state}",
+            "decision": None
+        }
+    
+    logger.info("recovery_attempt_started",
+               participant_id=participant_id,
+               peer_count=len(peer_urls))
+    
+    # Query all peers for their states
+    peer_states = {}
+    for peer_url in peer_urls:
+        try:
+            response = requests.get(f"{peer_url}/peer-state", timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                peer_states[peer_url] = {
+                    "state": data['state'],
+                    "participant_id": data['participant_id']
+                }
+                logger.info("peer_state_received",
+                          peer=data['participant_id'],
+                          state=data['state'])
+            else:
+                peer_states[peer_url] = {"state": "UNKNOWN", "error": "HTTP error"}
+                logger.warning("peer_query_failed",
+                             peer=peer_url,
+                             status=response.status_code)
+        except Exception as e:
+            peer_states[peer_url] = {"state": "UNKNOWN", "error": str(e)}
+            logger.error("peer_query_exception",
+                        peer=peer_url,
+                        error=str(e))
+    
+    # Decision logic: ALL peers must be in PRE_COMMIT
+    peer_state_values = [p["state"] for p in peer_states.values()]
+    all_in_precommit = all(state == "PRE_COMMIT" for state in peer_state_values)
+    
+    if all_in_precommit:
+        # Safe to commit!
+        logger.info("recovery_decision_commit",
+                   participant_id=participant_id,
+                   reason="all peers in PRE_COMMIT state",
+                   peer_states=peer_states)
+        
+        participant_state_manager.transition_to(
+            ParticipantState.COMMIT,
+            reason="Non-blocking recovery: coordinator failed, all participants in PRE_COMMIT"
+        )
+        
+        return {
+            "can_recover": True,
+            "decision": "COMMIT",
+            "reason": "All peers in PRE_COMMIT, safe to commit",
+            "peer_states": peer_states,
+            "final_state": "COMMIT"
+        }
+    else:
+        # Not safe - abort
+        logger.info("recovery_decision_abort",
+                   participant_id=participant_id,
+                   reason="not all peers in PRE_COMMIT",
+                   peer_states=peer_states)
+        
+        participant_state_manager.transition_to(
+            ParticipantState.ABORT,
+            reason="Recovery failed: inconsistent peer states"
+        )
+        
+        return {
+            "can_recover": True,
+            "decision": "ABORT",
+            "reason": "Not all peers in PRE_COMMIT",
+            "peer_states": peer_states,
+            "final_state": "ABORT"
+        }
 
 
 @app.route('/health', methods=['GET'])
@@ -277,6 +384,78 @@ def get_state():
         "is_final": participant_state_manager.is_final_state(),
         "can_commit_without_coordinator": participant_state_manager.can_commit_without_coordinator(),
         "state_history": [s.value for s in participant_state_manager.state_history]
+    }), 200
+
+
+@app.route('/peer-state', methods=['GET'])
+def get_peer_state():
+    """
+    Endpoint for other participants to query this participant's state.
+    
+    Used during recovery protocol when coordinator has failed.
+    Other participants can query this endpoint to determine if it's
+    safe to commit without the coordinator.
+    
+    Returns:
+        JSON response with current state and transaction info
+    """
+    if participant_state_manager is None:
+        return jsonify({
+            "status": "error",
+            "message": "No active transaction"
+        }), 400
+    
+    state = participant_state_manager.get_state()
+    can_commit = participant_state_manager.can_commit_without_coordinator()
+    
+    logger.info("peer_state_requested",
+               participant_id=participant_id,
+               state=state.value,
+               can_commit=can_commit)
+    
+    return jsonify({
+        "participant_id": participant_id,
+        "state": state.value,
+        "transaction_id": participant_state_manager.transaction_id,
+        "can_commit_without_coordinator": can_commit,
+        "state_history": [s.value for s in participant_state_manager.state_history]
+    }), 200
+
+
+@app.route('/recover', methods=['POST'])
+def trigger_recovery():
+    """
+    Manually trigger non-blocking recovery protocol.
+    
+    Used to demonstrate 3PC's advantage over 2PC when coordinator fails.
+    
+    Request JSON:
+        {
+            "peers": ["http://host:port", ...]
+        }
+    
+    Returns:
+        Recovery result with decision and final state
+    """
+    data = request.get_json()
+    peer_urls = data.get('peers', [])
+    
+    if not peer_urls:
+        return jsonify({
+            "status": "error",
+            "message": "No peer URLs provided"
+        }), 400
+    
+    logger.info("recovery_triggered",
+               participant_id=participant_id,
+               peer_count=len(peer_urls))
+    
+    result = attempt_recovery(peer_urls)
+    
+    return jsonify({
+        "participant_id": participant_id,
+        "recovery_attempted": True,
+        **result
     }), 200
 
 

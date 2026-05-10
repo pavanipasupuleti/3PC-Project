@@ -94,6 +94,7 @@ def get_transaction_status(txn_id):
         "state_history": [s.value for s in state_mgr.state_history]
     }), 200
 
+
 @app.route('/execute-transaction', methods=['POST'])
 def execute_transaction():
     """
@@ -214,6 +215,20 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
             "reason": "Not all participants acknowledged PRE_COMMIT",
             "acks": acks
         }
+    
+    # ⚠️ DEMO PAUSE: Coordinator crashes here in demo
+    logger.info("DEMO_PAUSE", 
+               message="⚠️  ALL PARTICIPANTS IN PRE_COMMIT - Coordinator can crash now!",
+               transaction_id=txn_id)
+    print("\n" + "="*70)
+    print(" DEMO: All participants are in PRE_COMMIT state")
+    print(" Press Ctrl+C NOW to simulate coordinator crash")
+    print("Or press Enter to complete normally")
+    print("="*70 + "\n")
+    input("Your choice: ")
+    
+    # If we reach here, coordinator survived
+    logger.info("DEMO_CONTINUE", message="Coordinator survived! Continuing to Phase 3")
     
     # PHASE 3: DO_COMMIT
     logger.info("phase_3_start", transaction_id=txn_id, phase="DO_COMMIT")
@@ -361,6 +376,7 @@ def send_abort(txn_id: str, participant_urls: List[str]):
             logger.info("abort_sent", url=url)
         except Exception as e:
             logger.error("abort_failed", url=url, error=str(e))
+
 
 def run_coordinator(host='127.0.0.1', port=5000):
     """
