@@ -3,32 +3,127 @@
 ## Project Overview
 Implementation of Three-Phase Commit protocol with partition simulation and non-blocking demonstration.
 
-## Tech Stack 
-- **Language:** Python 3.12
-- **Communication:** HTTP/REST + JSON (Flask)
-- **Storage:** SQLite (WAL)
-- **Logging:** structlog (Python)
-- **Serialization:** JSON
-- **Concurrency:** Python threading + mutex
-- **Time:** Local monotonic clock
-- **Testing:** Toxiproxy (network fault simulation)
-- **Container:** Docker + Docker Compose
+## Technology Stack
+
+### Overview Table
+
+| Technology | Role in This Project |
+|------------|---------------------|
+| Python 3 | Core programming language for all services |
+| Flask | HTTP server for coordinator, participants, and dashboard |
+| Docker | Packages each service into an isolated container |
+| Docker Compose | Starts and wires all containers together |
+| SQLite | Persists transaction state to disk |
+| etcd | Distributed leader election for the coordinator |
+| Toxiproxy | Simulates network partitions by blocking traffic |
+| structlog | Structured, readable JSON-style logging |
+| threading | Background threads for heartbeats and monitors |
+| REST APIs | Communication protocol between all services |
 
 ## Setup
 1. Create virtual environment: `python3 -m venv venv`
 2. Activate: `source venv/bin/activate`
 3. Install: `python3 -m pip install -r requirements.txt`
 
-## Progress
--  Phase 1: Environment setup 
--  Phase 2: Python environment 
--  Phase 3: Design (state machines, messages)
--  Phase 4: Core 3PC protocol
--  Phase 5: WAL + Recovery
--  Phase 6: Partition simulation
--  Phase 7: Non-blocking demonstration
 
+## How to Run the Project
 
+### Prerequisites
+
+- Docker Desktop installed and running
+- Python 3.8+
+- `make` utility (comes with Linux/macOS; Windows users can use Git Bash)
+
+### Step 1: Clone and Navigate
+
+```bash
+cd 3PC-Project
+```
+
+### Step 2: Build Docker Images
+
+```bash
+make build
+```
+
+This builds the Python application image using the `Dockerfile`. All containers (coordinator, 3 participants, dashboard) use this same image.
+
+### Step 3: Start All Services
+
+```bash
+make up
+```
+
+This starts 7 containers:
+- etcd (leader election)
+- toxiproxy (partition simulation)
+- coordinator (port 5000)
+- participant1 (port 5001)
+- participant2 (port 5002)
+- participant3 (port 5003)
+- dashboard (port 8000)
+
+It waits 25 seconds for all services to become healthy.
+
+### Step 4: Verify Everything is Running
+
+```bash
+make health
+```
+
+Expected output shows all containers healthy, leader status `is_leader=true`, and dashboard responding.
+
+### Step 5: Set Up Toxiproxy Proxies
+
+```bash
+python3 scripts/inject_partition.py setup
+```
+
+This creates the three proxies in Toxiproxy. Must be done once after `make up`.
+
+### Step 6: Run a Transaction
+
+```bash
+make test-transaction
+```
+
+### Step 7: Open Dashboard
+
+Open browser: `http://localhost:8000`
+
+### Step 8: Run Integration Tests
+
+```bash
+pytest tests/test_partition_recovery.py -v
+```
+
+### Step 9: Inject a Partition
+
+```bash
+# Block participant 1
+python3 scripts/inject_partition.py 1 on
+
+# Try a transaction (should abort)
+make test-transaction
+
+# Restore participant 1
+python3 scripts/inject_partition.py 1 off
+
+# Transaction should succeed again
+make test-transaction
+```
+
+### Step 10: Stop Everything
+
+```bash
+make down
+```
+
+### Full Cleanup (removes images and databases)
+
+```bash
+make clean
+```
 
 ## Architecture Diagrams
 
