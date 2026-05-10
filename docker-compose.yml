@@ -32,7 +32,7 @@ services:
   # toxiproxy — network fault injection
   # ----------------------------------------------------------------
   toxiproxy-server:
-    image: shopify/toxiproxy:2.5.0
+    image: shopify/toxiproxy:latest
     container_name: 3pc-toxiproxy
     ports:
       - "8474:8474"   # Admin API
