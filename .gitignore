@@ -33,3 +33,4 @@ storage/*.db-journal
 
 # Environment
 .env
+data/

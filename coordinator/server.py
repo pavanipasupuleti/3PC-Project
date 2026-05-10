@@ -10,6 +10,10 @@ from coordinator.state import CoordinatorStateManager, CoordinatorState
 from coordinator.messages import Message, MessageType, create_transaction_id
 import requests
 from typing import List, Dict
+import time
+from datetime import datetime
+from metrics.collector import metrics
+from storage.database import db_store
 
 logger = structlog.get_logger()
 
@@ -34,6 +38,17 @@ def health_check():
         "service": "coordinator",
         "message": "Coordinator is running"
     }), 200
+
+
+@app.route('/metrics', methods=['GET'])
+def get_metrics_endpoint():
+    """
+    Get metrics snapshot.
+    
+    Expose metrics to dashboard.
+    """
+    snapshot = metrics.get_snapshot()
+    return jsonify(snapshot), 200
 
 
 @app.route('/start-transaction', methods=['POST'])
@@ -152,8 +167,27 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
     Phase 2: PRE_COMMIT
     Phase 3: DO_COMMIT
     """
+    # Record transaction start
+    metrics.record_transaction_start(txn_id)
+    total_start_time = time.monotonic()  # 🆕 Changed to monotonic
+    
+    # 🆕 Log transaction start in database
+    created_at = datetime.now()
+    db_store.save_transaction(
+        txn_id=txn_id,
+        status='STARTED',
+        num_participants=len(participant_urls),
+        created_at=created_at
+    )
+    db_store.log_event(
+        txn_id,
+        'TRANSACTION_STARTED',
+        details=f'{len(participant_urls)} participants'
+    )
+    
     # PHASE 1: CAN_COMMIT
     logger.info("phase_1_start", transaction_id=txn_id, phase="CAN_COMMIT")
+    phase1_start = time.monotonic()  # 🆕 Changed to monotonic
     
     # First, initialize all participants with transaction
     for url in participant_urls:
@@ -167,13 +201,30 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
                 raise Exception(f"Failed to initialize participant {url}")
         except Exception as e:
             logger.error("participant_init_failed", url=url, error=str(e))
+            
+            # 🆕 Log failure in database
+            db_store.save_transaction(
+                txn_id=txn_id,
+                status='FAILED',
+                num_participants=len(participant_urls),
+                created_at=created_at,
+                completed_at=datetime.now()
+            )
+            db_store.log_event(txn_id, 'INITIALIZATION_FAILED', details=str(e))
             raise
     
     # Transition to WAIT state
     state_mgr.transition_to(CoordinatorState.WAIT)
+    db_store.log_event(txn_id, 'STATE_TRANSITION', phase='WAIT')
     
     # Send CAN_COMMIT to all participants
     votes = send_can_commit(txn_id, participant_urls)
+    
+    # Record Phase 1 latency
+    phase1_time = (time.monotonic() - phase1_start) * 1000  # 🆕 Changed to monotonic
+    metrics.record_phase_latency(1, phase1_time)
+    db_store.log_event(txn_id, 'PHASE_1_COMPLETE', phase='CAN_COMMIT', 
+                      details=f'Latency: {phase1_time:.2f}ms')
     
     # Check votes
     all_yes = all(vote == "YES" for vote in votes.values())
@@ -183,6 +234,21 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
         logger.info("aborting_transaction", transaction_id=txn_id, reason="not all voted YES")
         state_mgr.transition_to(CoordinatorState.ABORT)
         send_abort(txn_id, participant_urls)
+        
+        # Record abort
+        metrics.record_abort(txn_id)
+        
+        # 🆕 Save abort to database
+        db_store.save_transaction(
+            txn_id=txn_id,
+            status='ABORT',
+            num_participants=len(participant_urls),
+            phase1_latency=phase1_time,
+            created_at=created_at,
+            completed_at=datetime.now()
+        )
+        db_store.log_event(txn_id, 'ABORTED', phase='PHASE_1', 
+                          details='Not all participants voted YES')
         
         return {
             "status": "aborted",
@@ -194,11 +260,19 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
     
     # PHASE 2: PRE_COMMIT
     logger.info("phase_2_start", transaction_id=txn_id, phase="PRE_COMMIT")
+    phase2_start = time.monotonic()  # 🆕 Changed to monotonic
     
     state_mgr.transition_to(CoordinatorState.PRE_COMMIT)
+    db_store.log_event(txn_id, 'STATE_TRANSITION', phase='PRE_COMMIT')
     
     # Send PRE_COMMIT to all participants
     acks = send_pre_commit(txn_id, participant_urls)
+    
+    # Record Phase 2 latency
+    phase2_time = (time.monotonic() - phase2_start) * 1000  # 🆕 Changed to monotonic
+    metrics.record_phase_latency(2, phase2_time)
+    db_store.log_event(txn_id, 'PHASE_2_COMPLETE', phase='PRE_COMMIT',
+                      details=f'Latency: {phase2_time:.2f}ms')
     
     # Check ACKs
     all_acked = all(ack == "ACK" for ack in acks.values())
@@ -208,6 +282,22 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
         state_mgr.transition_to(CoordinatorState.ABORT)
         send_abort(txn_id, participant_urls)
         
+        # Record abort
+        metrics.record_abort(txn_id)
+        
+        # 🆕 Save abort to database
+        db_store.save_transaction(
+            txn_id=txn_id,
+            status='ABORT',
+            num_participants=len(participant_urls),
+            phase1_latency=phase1_time,
+            phase2_latency=phase2_time,
+            created_at=created_at,
+            completed_at=datetime.now()
+        )
+        db_store.log_event(txn_id, 'ABORTED', phase='PHASE_2',
+                          details='Not all participants acknowledged PRE_COMMIT')
+        
         return {
             "status": "aborted",
             "transaction_id": txn_id,
@@ -216,29 +306,43 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
             "acks": acks
         }
     
-    # ⚠️ DEMO PAUSE: Coordinator crashes here in demo
-    logger.info("DEMO_PAUSE", 
-               message="⚠️  ALL PARTICIPANTS IN PRE_COMMIT - Coordinator can crash now!",
-               transaction_id=txn_id)
-    print("\n" + "="*70)
-    print(" DEMO: All participants are in PRE_COMMIT state")
-    print(" Press Ctrl+C NOW to simulate coordinator crash")
-    print("Or press Enter to complete normally")
-    print("="*70 + "\n")
-    input("Your choice: ")
-    
-    # If we reach here, coordinator survived
-    logger.info("DEMO_CONTINUE", message="Coordinator survived! Continuing to Phase 3")
-    
     # PHASE 3: DO_COMMIT
     logger.info("phase_3_start", transaction_id=txn_id, phase="DO_COMMIT")
+    phase3_start = time.monotonic()  # 🆕 Changed to monotonic
     
     state_mgr.transition_to(CoordinatorState.COMMIT)
+    db_store.log_event(txn_id, 'STATE_TRANSITION', phase='COMMIT')
     
     # Send DO_COMMIT to all participants
     commits = send_do_commit(txn_id, participant_urls)
     
+    # Record Phase 3 latency
+    phase3_time = (time.monotonic() - phase3_start) * 1000  # 🆕 Changed to monotonic
+    metrics.record_phase_latency(3, phase3_time)
+    db_store.log_event(txn_id, 'PHASE_3_COMPLETE', phase='DO_COMMIT',
+                      details=f'Latency: {phase3_time:.2f}ms')
+    
     logger.info("transaction_committed", transaction_id=txn_id)
+    
+    # Record total latency and commit
+    total_time = (time.monotonic() - total_start_time) * 1000  # 🆕 Changed to monotonic
+    metrics.record_total_latency(total_time)
+    metrics.record_commit(txn_id)
+    
+    # 🆕 Save successful commit to database
+    db_store.save_transaction(
+        txn_id=txn_id,
+        status='COMMIT',
+        num_participants=len(participant_urls),
+        phase1_latency=phase1_time,
+        phase2_latency=phase2_time,
+        phase3_latency=phase3_time,
+        total_latency=total_time,
+        created_at=created_at,
+        completed_at=datetime.now()
+    )
+    db_store.log_event(txn_id, 'COMMITTED', phase='PHASE_3',
+                      details=f'Total latency: {total_time:.2f}ms')
     
     return {
         "status": "committed",
@@ -284,6 +388,7 @@ def send_can_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
         except Exception as e:
             votes[url] = "NO"
             logger.error("vote_timeout", url=url, error=str(e))
+            metrics.record_timeout()
     
     return votes
 
@@ -319,6 +424,7 @@ def send_pre_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
         except Exception as e:
             acks[url] = "FAIL"
             logger.error("ack_timeout", url=url, error=str(e))
+            metrics.record_timeout()
     
     return acks
 
@@ -352,6 +458,7 @@ def send_do_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
         except Exception as e:
             commits[url] = "FAILED"
             logger.error("commit_timeout", url=url, error=str(e))
+            metrics.record_timeout()
     
     return commits
 

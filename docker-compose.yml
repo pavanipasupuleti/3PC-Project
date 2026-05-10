@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  coordinator:
+    build: .
+    container_name: 3pc-coordinator
+    command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5000)"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - 3pc-network
+    environment:
+      - FLASK_ENV=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  participant1:
+    build: .
+    container_name: 3pc-participant1
+    command: python3 -c "from participant.server import run_participant; run_participant('participant_1', host='0.0.0.0', port=5001)"
+    ports:
+      - "5001:5001"
+    networks:
+      - 3pc-network
+    depends_on:
+      - coordinator  # 🆕 CHANGED - removed condition
+
+  participant2:
+    build: .
+    container_name: 3pc-participant2
+    command: python3 -c "from participant.server import run_participant; run_participant('participant_2', host='0.0.0.0', port=5002)"
+    ports:
+      - "5002:5002"
+    networks:
+      - 3pc-network
+    depends_on:
+      - coordinator  # 🆕 CHANGED - removed condition
+
+  participant3:
+    build: .
+    container_name: 3pc-participant3
+    command: python3 -c "from participant.server import run_participant; run_participant('participant_3', host='0.0.0.0', port=5003)"
+    ports:
+      - "5003:5003"
+    networks:
+      - 3pc-network
+    depends_on:
+      - coordinator  # 🆕 CHANGED - removed condition
+
+  dashboard:
+    build: .
+    container_name: 3pc-dashboard
+    command: python3 -m dashboard.app
+    ports:
+      - "8000:8000"
+    networks:
+      - 3pc-network
+    depends_on:
+      - coordinator  #  - removed condition
+
+networks:
+  3pc-network:
+    driver: bridge

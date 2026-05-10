@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3PC Metrics Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e1e1e 0%, #2c2c2c 100%);
+            color: #fff;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        
+        h1 { 
+            color: #fff;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #e0e0e0;
+            font-size: 1.2em;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-box {
+            background: linear-gradient(135deg, #2c2c2c 0%, #3a3a3a 100%);
+            padding: 25px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            transition: transform 0.3s ease;
+        }
+        
+        .metric-box:hover {
+            transform: translateY(-5px);
+        }
+        
+        .metric-label {
+            font-size: 0.9em;
+            color: #aaa;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #3498db;
+        }
+        
+        .metric-value.success { color: #2ecc71; }
+        .metric-value.danger { color: #e74c3c; }
+        .metric-value.warning { color: #f39c12; }
+        
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .chart {
+            background: linear-gradient(135deg, #2c2c2c 0%, #3a3a3a 100%);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            min-height: 400px;
+        }
+        
+        .chart-full {
+            grid-column: 1 / -1;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #2ecc71;
+            animation: pulse 2s infinite;
+            margin-right: 8px;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .update-info {
+            text-align: center;
+            margin-top: 20px;
+            color: #888;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎯 3PC Protocol Metrics Dashboard</h1>
+        <div class="subtitle">
+            <span class="status-indicator"></span>
+            Real-time monitoring of Three-Phase Commit transactions
+        </div>
+    </div>
+    
+    <div id="metrics-summary" class="metrics-grid"></div>
+    
+    <div class="charts-grid">
+        <div class="chart" id="commit-rate-chart"></div>
+        <div class="chart" id="latency-chart"></div>
+        <div class="chart chart-full" id="latency-trend-chart"></div>
+    </div>
+    
+    <div class="update-info">
+        Auto-refreshing every 2 seconds | Last update: <span id="last-update">--</span>
+    </div>
+    
+    <script>
+        function updateDashboard() {
+            fetch('/api/metrics')
+                .then(r => r.json())
+                .then(data => {
+                    // Update summary metrics
+                    const commitRate = data.transactions.commit_rate || 0;
+                    
+                    document.getElementById('metrics-summary').innerHTML = `
+                        <div class="metric-box">
+                            <div class="metric-label">Total Transactions</div>
+                            <div class="metric-value">${data.transactions.total}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">Committed</div>
+                            <div class="metric-value success">${data.transactions.committed}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">Aborted</div>
+                            <div class="metric-value danger">${data.transactions.aborted}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">Recoveries</div>
+                            <div class="metric-value warning">${data.recovery.count}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">Success Rate</div>
+                            <div class="metric-value">${commitRate.toFixed(1)}%</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="metric-label">Avg Total Latency</div>
+                            <div class="metric-value">${data.latency.total_avg.toFixed(2)}ms</div>
+                        </div>
+                    `;
+                    
+                    // Commit Rate Pie Chart
+                    let committed = data.transactions.committed || 0;
+                    let aborted = data.transactions.aborted || 0;
+
+                    let pie_values, pie_labels, pie_colors;
+                    if (committed === 0 && aborted === 0) {
+                        pie_values = [1];
+                        pie_labels = ['No Data'];
+                        pie_colors = ['#444444'];
+                    } else {
+                        pie_values = aborted > 0 ? [committed, aborted] : [committed];
+                        pie_labels = aborted > 0 ? ['Committed', 'Aborted'] : ['Committed'];
+                        pie_colors = aborted > 0 ? ['#00ff88', '#ff4444'] : ['#00ff88'];
+                    }
+
+                    Plotly.newPlot('commit-rate-chart', [{
+                        values: pie_values,
+                        labels: pie_labels,
+                        type: 'pie',
+                        hole: 0.4,
+                        marker: {
+                            colors: pie_colors
+                        },
+                        textinfo: 'label+percent',
+                        textfont: {
+                            size: 14,
+                            color: 'white'
+                        }
+                    }], {
+                        title: {
+                            text: 'Transaction Outcomes',
+                            font: { color: 'white', size: 18 }
+                        },
+                        paper_bgcolor: 'rgba(0,0,0,0)',
+                        plot_bgcolor: 'rgba(0,0,0,0)',
+                        showlegend: true,
+                        legend: {
+                            font: { color: 'white' }
+                        },
+                        height: 360
+                    }, {responsive: true});
+                    
+                    // Phase Latency Bar Chart
+                    Plotly.newPlot('latency-chart', [{
+                        x: ['Phase 1<br>Voting', 'Phase 2<br>Pre-Commit', 'Phase 3<br>Commit'],
+                        y: [
+                            data.latency.phase1_avg,
+                            data.latency.phase2_avg,
+                            data.latency.phase3_avg
+                        ],
+                        type: 'bar',
+                        marker: {
+                            color: ['#3498db', '#9b59b6', '#2ecc71']
+                        },
+                        texttemplate: '%{y:.2f}ms',
+                        textposition: 'outside',
+                        textfont: {
+                            color: 'white',
+                            size: 14,
+                            family: 'Arial, sans-serif'
+                        },
+                        cliponaxis: false
+                    }], {
+                        title: {
+                            text: 'Average Phase Latency',
+                            font: { color: 'white', size: 18 }
+                        },
+                        yaxis: {
+                            title: 'Latency (ms)',
+                            gridcolor: '#444',
+                            color: 'white'
+                        },
+                        xaxis: {
+                            color: 'white'
+                        },
+                        paper_bgcolor: 'rgba(0,0,0,0)',
+                        plot_bgcolor: 'rgba(0,0,0,0)',
+                        height: 360
+                    }, {responsive: true});
+                    
+                    // Latency Trend Line Chart
+                    const phase1_data = data.latency.phase1_data || [];
+                    const phase2_data = data.latency.phase2_data || [];
+                    const phase3_data = data.latency.phase3_data || [];
+                    const x_vals = Array.from({length: phase1_data.length}, (_, i) => i + 1);
+                    
+                    Plotly.newPlot('latency-trend-chart', [
+                        {
+                            x: x_vals,
+                            y: phase1_data,
+                            mode: 'lines+markers',
+                            name: 'Phase 1 (Voting)',
+                            line: { color: '#3498db', width: 3 },
+                            marker: { size: 8 }
+                        },
+                        {
+                            x: x_vals,
+                            y: phase2_data,
+                            mode: 'lines+markers',
+                            name: 'Phase 2 (Pre-Commit)',
+                            line: { color: '#9b59b6', width: 3 },
+                            marker: { size: 8 }
+                        },
+                        {
+                            x: x_vals,
+                            y: phase3_data,
+                            mode: 'lines+markers',
+                            name: 'Phase 3 (Commit)',
+                            line: { color: '#2ecc71', width: 3 },
+                            marker: { size: 8 }
+                        }
+                    ], {
+                        title: {
+                            text: 'Latency Trend (Last 20 Transactions)',
+                            font: { color: 'white', size: 18 }
+                        },
+                        xaxis: {
+                            title: 'Transaction Number',
+                            gridcolor: '#444',
+                            color: 'white'
+                        },
+                        yaxis: {
+                            title: 'Latency (ms)',
+                            gridcolor: '#444',
+                            color: 'white'
+                        },
+                        paper_bgcolor: 'rgba(0,0,0,0)',
+                        plot_bgcolor: 'rgba(0,0,0,0)',
+                        legend: {
+                            font: { color: 'white' }
+                        },
+                        hovermode: 'x unified',
+                        height: 400
+                    }, {responsive: true});
+                    
+                    // Update last update time
+                    document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                })
+                .catch(err => {
+                    console.error('Dashboard update error:', err);
+                });
+        }
+        
+        // Initial load
+        updateDashboard();
+        
+        // Update every 2 seconds
+        setInterval(updateDashboard, 2000);
+    </script>
+</body>
+</html>
