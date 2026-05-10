@@ -77,7 +77,7 @@ def setup_proxies() -> None:
     for pid, cfg in PROXIES.items():
         resp = _admin(
             "post",
-            "/api/proxies",
+            "/proxies",
             json={
                 "name":     cfg["name"],
                 "listen":   cfg["listen"],
@@ -103,7 +103,7 @@ def partition(participant_id: str, block: bool) -> None:
     cfg = _resolve(participant_id)
     resp = _admin(
         "post",
-        f"/api/proxies/{cfg['name']}",
+        f"/proxies/{cfg['name']}",
         json={
             "name":     cfg["name"],
             "listen":   cfg["listen"],
@@ -123,7 +123,7 @@ def add_latency(participant_id: str, latency_ms: int) -> None:
     cfg = _resolve(participant_id)
     resp = _admin(
         "post",
-        f"/api/proxies/{cfg['name']}/toxics",
+        f"/proxies/{cfg['name']}/toxics",
         json={
             "name":       f"latency-{cfg['name']}",
             "type":       "latency",
@@ -145,7 +145,7 @@ def restore_all() -> None:
 
 def show_status() -> None:
     """Print current proxy states."""
-    resp = _admin("get", "/api/proxies")
+    resp = _admin("get", "/proxies")
     proxies: dict = resp.json()
 
     print(f"\n{'Proxy':<20} {'Listen':<18} {'Upstream':<26} Status")
