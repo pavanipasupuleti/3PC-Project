@@ -68,8 +68,6 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
-      toxiproxy-server:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=5)"]
       interval: 10s
@@ -98,7 +96,6 @@ services:
       - PARTICIPANT_DB_PATH=data/3pc_participant_1.db
     depends_on:
       - coordinator
-      - toxiproxy-server
 
   participant2:
     build: .
@@ -116,7 +113,6 @@ services:
       - PARTICIPANT_DB_PATH=data/3pc_participant_2.db
     depends_on:
       - coordinator
-      - toxiproxy-server
 
   participant3:
     build: .
@@ -134,7 +130,6 @@ services:
       - PARTICIPANT_DB_PATH=data/3pc_participant_3.db
     depends_on:
       - coordinator
-      - toxiproxy-server
 
   # ----------------------------------------------------------------
   # dashboard
