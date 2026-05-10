@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 import structlog
 from coordinator.state import CoordinatorStateManager, CoordinatorState
 from coordinator.messages import Message, MessageType, create_transaction_id
+from coordinator.leader_election import LeaderElection
 import requests
 from typing import List, Dict
 import time
@@ -19,6 +20,10 @@ logger = structlog.get_logger()
 
 # Create Flask app
 app = Flask(__name__)
+
+# Leader election — only the leader executes transactions
+election = LeaderElection(node_id='coordinator-1')
+election.try_become_leader()
 
 # Store active transactions (in memory for now)
 # In real system, this would be in database
@@ -117,9 +122,15 @@ def execute_transaction():
     
     This orchestrates all 3 phases automatically.
     """
+    if not election.is_leader:
+        return jsonify({
+            "error": "Not leader",
+            "leader": election.get_current_leader()
+        }), 503
+
     data = request.get_json()
     participant_urls = data.get('participants', [])
-    
+
     if not participant_urls:
         return jsonify({
             "status": "error",
@@ -483,6 +494,21 @@ def send_abort(txn_id: str, participant_urls: List[str]):
             logger.info("abort_sent", url=url)
         except Exception as e:
             logger.error("abort_failed", url=url, error=str(e))
+
+
+@app.route('/leader-status', methods=['GET'])
+def leader_status():
+    """
+    Report this node's leadership status.
+
+    Returns whether this coordinator is the current leader
+    and who holds the lock in etcd.
+    """
+    return jsonify({
+        "node_id": election.node_id,
+        "is_leader": election.is_leader,
+        "current_leader": election.get_current_leader()
+    }), 200
 
 
 def run_coordinator(host='127.0.0.1', port=5000):
