@@ -1,521 +1,433 @@
 """
 Participant Flask server for 3PC protocol.
 
-This is the participant's "mouth and ears" - handles HTTP communication.
+Key changes from the original:
+  - GlobalStateManager replaces the single-global state manager,
+    supporting multiple concurrent transactions with thread safety.
+  - HeartbeatMonitor detects coordinator silence automatically.
+  - AutoRecovery resolves pending transactions without coordinator.
+  - State is persisted to SQLite; restarts resume from last known state.
+  - Peer URLs are read from the PARTICIPANT_PEERS environment variable.
+  - Protocol message sends have NO timeout (infinite); only admin
+    endpoints (heartbeat, health, peer queries) use a short timeout.
 """
 
-from flask import Flask, request, jsonify
+import json
+import os
+import threading
+from typing import Optional
+
 import structlog
 import requests
-from participant.state import ParticipantStateManager, ParticipantState
+from flask import Flask, jsonify, request
+
 from coordinator.messages import Message, MessageType
+from participant.auto_recovery import AutoRecovery
+from participant.state_manager import GlobalStateManager
+from participant.timeout_detector import HeartbeatMonitor
 
 logger = structlog.get_logger()
 
-# Create Flask app
 app = Flask(__name__)
 
-# Participant configuration
-# Will be set when server starts
-participant_id = None
-participant_state_manager = None
+# ------------------------------------------------------------------
+# Module-level globals — initialised in run_participant()
+# ------------------------------------------------------------------
+
+participant_id: Optional[str] = None
+state_manager: Optional[GlobalStateManager] = None
+heartbeat_monitor: Optional[HeartbeatMonitor] = None
+auto_recovery: Optional[AutoRecovery] = None
+
+# Lock protecting the participant_id / state_manager pair during
+# concurrent init-transaction requests.
+_init_lock = threading.Lock()
 
 
-def attempt_recovery(peer_urls: list) -> dict:
+def _peer_urls() -> list:
     """
-    Attempt to recover from coordinator failure using peer consensus.
-    
-    This is the core of 3PC's non-blocking property!
-    
-    Recovery rules:
-    1. Can only recover if in PRE_COMMIT state
-    2. Query all peer participants for their states
-    3. If ALL peers in PRE_COMMIT → safe to COMMIT
-    4. Otherwise → ABORT
-    
-    Args:
-        peer_urls: List of peer participant URLs to query
-        
-    Returns:
-        dict with recovery decision and details
+    Return peer participant URLs from the PARTICIPANT_PEERS env var.
+
+    The value must be a JSON array of URL strings, e.g.:
+        ["http://toxiproxy-server:5012", "http://toxiproxy-server:5013"]
     """
-    global participant_state_manager
-    
-    # Can only attempt recovery from PRE_COMMIT state
-    if not participant_state_manager.can_commit_without_coordinator():
-        current_state = participant_state_manager.get_state().value
-        logger.warning("recovery_not_possible",
-                      participant_id=participant_id,
-                      current_state=current_state,
-                      reason="not in PRE_COMMIT state")
-        return {
-            "can_recover": False,
-            "reason": f"Cannot recover from state {current_state}",
-            "decision": None
-        }
-    
-    logger.info("recovery_attempt_started",
-               participant_id=participant_id,
-               peer_count=len(peer_urls))
-    
-    # Query all peers for their states
-    peer_states = {}
-    for peer_url in peer_urls:
-        try:
-            response = requests.get(f"{peer_url}/peer-state", timeout=2)
-            if response.status_code == 200:
-                data = response.json()
-                peer_states[peer_url] = {
-                    "state": data['state'],
-                    "participant_id": data['participant_id']
-                }
-                logger.info("peer_state_received",
-                          peer=data['participant_id'],
-                          state=data['state'])
-            else:
-                peer_states[peer_url] = {"state": "UNKNOWN", "error": "HTTP error"}
-                logger.warning("peer_query_failed",
-                             peer=peer_url,
-                             status=response.status_code)
-        except Exception as e:
-            peer_states[peer_url] = {"state": "UNKNOWN", "error": str(e)}
-            logger.error("peer_query_exception",
-                        peer=peer_url,
-                        error=str(e))
-    
-    # Decision logic: ALL peers must be in PRE_COMMIT
-    peer_state_values = [p["state"] for p in peer_states.values()]
-    all_in_precommit = all(state == "PRE_COMMIT" for state in peer_state_values)
-    
-    if all_in_precommit:
-        # Safe to commit!
-        logger.info("recovery_decision_commit",
-                   participant_id=participant_id,
-                   reason="all peers in PRE_COMMIT state",
-                   peer_states=peer_states)
-        
-        participant_state_manager.transition_to(
-            ParticipantState.COMMIT,
-            reason="Non-blocking recovery: coordinator failed, all participants in PRE_COMMIT"
-        )
-        
-        return {
-            "can_recover": True,
-            "decision": "COMMIT",
-            "reason": "All peers in PRE_COMMIT, safe to commit",
-            "peer_states": peer_states,
-            "final_state": "COMMIT"
-        }
-    else:
-        # Not safe - abort
-        logger.info("recovery_decision_abort",
-                   participant_id=participant_id,
-                   reason="not all peers in PRE_COMMIT",
-                   peer_states=peer_states)
-        
-        participant_state_manager.transition_to(
-            ParticipantState.ABORT,
-            reason="Recovery failed: inconsistent peer states"
-        )
-        
-        return {
-            "can_recover": True,
-            "decision": "ABORT",
-            "reason": "Not all peers in PRE_COMMIT",
-            "peer_states": peer_states,
-            "final_state": "ABORT"
-        }
+    raw = os.environ.get("PARTICIPANT_PEERS", "[]")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.error("invalid_participant_peers_env", raw=raw)
+        return []
 
 
-@app.route('/health', methods=['GET'])
+# ------------------------------------------------------------------
+# Recovery callback — fired by HeartbeatMonitor on coordinator silence
+# ------------------------------------------------------------------
+
+def _on_coordinator_timeout() -> None:
+    """Trigger automatic recovery when coordinator goes silent."""
+    if auto_recovery is None:
+        return
+    logger.warning("auto_recovery_triggered", participant_id=participant_id)
+    results = auto_recovery.attempt_recovery()
+    logger.info("auto_recovery_complete",
+                participant_id=participant_id, results=results)
+
+
+# ------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------
+
+@app.route("/health", methods=["GET"])
 def health_check():
-    """
-    Health check endpoint.
-    
-    Returns OK if participant is running.
-    """
     return jsonify({
         "status": "healthy",
         "service": "participant",
         "participant_id": participant_id,
-        "message": "Participant is running"
     }), 200
 
 
-@app.route('/message', methods=['POST'])
-def receive_message():
+# ------------------------------------------------------------------
+# Coordinator heartbeat endpoint
+# ------------------------------------------------------------------
+
+@app.route("/heartbeat", methods=["POST"])
+def receive_heartbeat():
     """
-    Receive a message from coordinator.
-    
-    Now handles different message types and responds appropriately.
+    Called by the coordinator every ~2 s.
+
+    Resets the HeartbeatMonitor's clock so it does not fire the
+    timeout callback while the coordinator is alive.
     """
-    global participant_state_manager
-    
-    data = request.get_json()
-    
-    # Convert JSON to Message object
-    try:
-        message = Message.from_dict(data)
-    except Exception as e:
-        logger.error("invalid_message", error=str(e))
-        return jsonify({
-            "status": "error",
-            "message": "Invalid message format"
-        }), 400
-    
-    logger.info(
-        "message_received",
-        participant_id=participant_id,
-        from_sender=message.sender,
-        message_type=message.message_type.value,
-        transaction_id=message.transaction_id
-    )
-    
-    # Check if we have state manager for this transaction
-    if participant_state_manager is None:
-        logger.error(
-            "no_state_manager",
-            participant_id=participant_id,
-            transaction_id=message.transaction_id
-        )
-        return jsonify({
-            "status": "error",
-            "message": "Participant not initialized with transaction"
-        }), 400
-    
-    # Handle different message types
-    response_message = None
-    
-    if message.message_type == MessageType.CAN_COMMIT:
-        # Phase 1: Coordinator asking if we can commit
-        response_message = handle_can_commit(message)
-    
-    elif message.message_type == MessageType.PRE_COMMIT:
-        # Phase 2: Coordinator telling us to prepare
-        response_message = handle_pre_commit(message)
-    
-    elif message.message_type == MessageType.DO_COMMIT:
-        # Phase 3: Coordinator telling us to commit
-        response_message = handle_do_commit(message)
-    
-    elif message.message_type == MessageType.ABORT:
-        # Coordinator telling us to abort
-        response_message = handle_abort(message)
-    
-    else:
-        logger.warning(
-            "unknown_message_type",
-            message_type=message.message_type.value
-        )
-        return jsonify({
-            "status": "error",
-            "message": f"Unknown message type: {message.message_type.value}"
-        }), 400
-    
-    # Return response
-    return jsonify({
-        "status": "success",
-        "participant_id": participant_id,
-        "response": response_message.to_dict() if response_message else None,
-        "current_state": participant_state_manager.get_state().value
-    }), 200
+    if heartbeat_monitor is not None:
+        heartbeat_monitor.update_heartbeat()
+    return jsonify({"status": "alive", "participant_id": participant_id}), 200
 
 
-def handle_can_commit(message: Message) -> Message:
-    """
-    Handle CAN_COMMIT message from coordinator.
-    
-    Decision logic: For now, always vote YES.
-    Later we can add conditions (e.g., check resources, random failures).
-    """
-    # Simple decision: always YES for now
-    vote = MessageType.YES
-    
-    # Transition to READY state (voted YES)
-    success = participant_state_manager.transition_to(
-        ParticipantState.READY,
-        reason="voted YES to CAN_COMMIT"
-    )
-    
-    if not success:
-        # If transition failed, vote NO instead
-        vote = MessageType.NO
-        participant_state_manager.transition_to(
-            ParticipantState.ABORT,
-            reason="invalid state transition, voting NO"
-        )
-    
-    # Create response message
-    response = Message(
-        transaction_id=message.transaction_id,
-        sender=participant_id,
-        receiver=message.sender,
-        message_type=vote,
-        state=participant_state_manager.get_state().value
-    )
-    
-    logger.info(
-        "voted",
-        participant_id=participant_id,
-        vote=vote.value,
-        new_state=participant_state_manager.get_state().value
-    )
-    
-    return response
+# ------------------------------------------------------------------
+# Transaction initialisation
+# ------------------------------------------------------------------
 
-
-def handle_pre_commit(message: Message) -> Message:
-    """
-    Handle PRE_COMMIT message from coordinator.
-    
-    This is Phase 2 - prepare to commit.
-    """
-    # Transition to PRE_COMMIT state
-    success = participant_state_manager.transition_to(
-        ParticipantState.PRE_COMMIT,
-        reason="received PRE_COMMIT from coordinator"
-    )
-    
-    if not success:
-        logger.error(
-            "pre_commit_failed",
-            participant_id=participant_id,
-            current_state=participant_state_manager.get_state().value
-        )
-    
-    # Send ACK back to coordinator
-    response = Message(
-        transaction_id=message.transaction_id,
-        sender=participant_id,
-        receiver=message.sender,
-        message_type=MessageType.ACK,
-        state=participant_state_manager.get_state().value
-    )
-    
-    return response
-
-
-def handle_do_commit(message: Message) -> Message:
-    """
-    Handle DO_COMMIT message from coordinator.
-    
-    This is Phase 3 - final commit.
-    """
-    # Transition to COMMIT state
-    success = participant_state_manager.transition_to(
-        ParticipantState.COMMIT,
-        reason="received DO_COMMIT from coordinator"
-    )
-    
-    if not success:
-        logger.error(
-            "commit_failed",
-            participant_id=participant_id,
-            current_state=participant_state_manager.get_state().value
-        )
-    
-    # Send COMMITTED confirmation
-    response = Message(
-        transaction_id=message.transaction_id,
-        sender=participant_id,
-        receiver=message.sender,
-        message_type=MessageType.ACK,
-        state=participant_state_manager.get_state().value,
-        data={"committed": True}
-    )
-    
-    logger.info(
-        "transaction_committed",
-        participant_id=participant_id,
-        transaction_id=message.transaction_id
-    )
-    
-    return response
-
-
-def handle_abort(message: Message) -> Message:
-    """
-    Handle ABORT message from coordinator.
-    
-    Abort the transaction.
-    """
-    # Transition to ABORT state
-    participant_state_manager.transition_to(
-        ParticipantState.ABORT,
-        reason="received ABORT from coordinator"
-    )
-    
-    # Send ACK back
-    response = Message(
-        transaction_id=message.transaction_id,
-        sender=participant_id,
-        receiver=message.sender,
-        message_type=MessageType.ACK,
-        state=participant_state_manager.get_state().value,
-        data={"aborted": True}
-    )
-    
-    logger.info(
-        "transaction_aborted",
-        participant_id=participant_id,
-        transaction_id=message.transaction_id
-    )
-    
-    return response
-
-
-@app.route('/state', methods=['GET'])
-def get_state():
-    """
-    Get participant's current state.
-    
-    Purpose: Check what state this participant is in.
-    """
-    if participant_state_manager is None:
-        return jsonify({
-            "status": "error",
-            "message": "Participant not initialized with transaction"
-        }), 400
-    
-    return jsonify({
-        "status": "success",
-        "participant_id": participant_id,
-        "state": participant_state_manager.get_state().value,
-        "is_final": participant_state_manager.is_final_state(),
-        "can_commit_without_coordinator": participant_state_manager.can_commit_without_coordinator(),
-        "state_history": [s.value for s in participant_state_manager.state_history]
-    }), 200
-
-
-@app.route('/peer-state', methods=['GET'])
-def get_peer_state():
-    """
-    Endpoint for other participants to query this participant's state.
-    
-    Used during recovery protocol when coordinator has failed.
-    Other participants can query this endpoint to determine if it's
-    safe to commit without the coordinator.
-    
-    Returns:
-        JSON response with current state and transaction info
-    """
-    if participant_state_manager is None:
-        return jsonify({
-            "status": "error",
-            "message": "No active transaction"
-        }), 400
-    
-    state = participant_state_manager.get_state()
-    can_commit = participant_state_manager.can_commit_without_coordinator()
-    
-    logger.info("peer_state_requested",
-               participant_id=participant_id,
-               state=state.value,
-               can_commit=can_commit)
-    
-    return jsonify({
-        "participant_id": participant_id,
-        "state": state.value,
-        "transaction_id": participant_state_manager.transaction_id,
-        "can_commit_without_coordinator": can_commit,
-        "state_history": [s.value for s in participant_state_manager.state_history]
-    }), 200
-
-
-@app.route('/recover', methods=['POST'])
-def trigger_recovery():
-    """
-    Manually trigger non-blocking recovery protocol.
-    
-    Used to demonstrate 3PC's advantage over 2PC when coordinator fails.
-    
-    Request JSON:
-        {
-            "peers": ["http://host:port", ...]
-        }
-    
-    Returns:
-        Recovery result with decision and final state
-    """
-    data = request.get_json()
-    peer_urls = data.get('peers', [])
-    
-    if not peer_urls:
-        return jsonify({
-            "status": "error",
-            "message": "No peer URLs provided"
-        }), 400
-    
-    logger.info("recovery_triggered",
-               participant_id=participant_id,
-               peer_count=len(peer_urls))
-    
-    result = attempt_recovery(peer_urls)
-    
-    return jsonify({
-        "participant_id": participant_id,
-        "recovery_attempted": True,
-        **result
-    }), 200
-
-
-@app.route('/init-transaction', methods=['POST'])
+@app.route("/init-transaction", methods=["POST"])
 def init_transaction():
     """
-    Initialize participant with a transaction.
-    
-    This creates the state manager for a new transaction.
+    Initialise this participant for a new transaction.
+
+    Called by the coordinator before Phase 1.
     """
-    global participant_state_manager
-    
+    global state_manager
+
     data = request.get_json()
-    transaction_id = data.get('transaction_id')
-    
-    if not transaction_id:
-        return jsonify({
-            "status": "error",
-            "message": "transaction_id required"
-        }), 400
-    
-    # Create state manager for this transaction
-    participant_state_manager = ParticipantStateManager(participant_id, transaction_id)
-    
-    logger.info(
-        "transaction_initialized",
-        participant_id=participant_id,
-        transaction_id=transaction_id
-    )
-    
+    txn_id = data.get("transaction_id")
+
+    if not txn_id:
+        return jsonify({"status": "error",
+                        "message": "transaction_id required"}), 400
+
+    if state_manager is None:
+        return jsonify({"status": "error",
+                        "message": "Participant not started"}), 503
+
+    with _init_lock:
+        state_manager.initialize(txn_id)
+
+    # A new transaction is in-flight; start the heartbeat clock.
+    if heartbeat_monitor is not None:
+        heartbeat_monitor.mark_transaction_active()
+
+    logger.info("transaction_initialized",
+                participant_id=participant_id, txn_id=txn_id[:8])
+
     return jsonify({
         "status": "success",
         "participant_id": participant_id,
-        "transaction_id": transaction_id,
-        "state": participant_state_manager.get_state().value
+        "transaction_id": txn_id,
+        "state": state_manager.get_state(txn_id),
     }), 201
 
 
-def run_participant(p_id, host='127.0.0.1', port=5001):
+# ------------------------------------------------------------------
+# Protocol message dispatch
+# ------------------------------------------------------------------
+
+@app.route("/message", methods=["POST"])
+def receive_message():
     """
-    Run the participant server.
-    
-    Args:
-        p_id: Participant identifier (e.g., "participant_1")
-        host: IP address to bind to
-        port: Port number to listen on
+    Receive a protocol message from the coordinator.
+
+    Dispatches to the appropriate phase handler based on message type.
     """
-    global participant_id
-    participant_id = p_id
-    
-    logger.info(
-        "participant_starting",
-        participant_id=participant_id,
-        host=host,
-        port=port
+    if state_manager is None:
+        return jsonify({"status": "error",
+                        "message": "Participant not started"}), 503
+
+    data = request.get_json()
+    try:
+        message = Message.from_dict(data)
+    except Exception as exc:
+        logger.error("invalid_message", error=str(exc))
+        return jsonify({"status": "error",
+                        "message": "Invalid message format"}), 400
+
+    txn_id = message.transaction_id
+
+    logger.info("message_received",
+                participant_id=participant_id,
+                message_type=message.message_type.value,
+                txn_id=txn_id[:8])
+
+    # Every coordinator message resets the heartbeat timer.
+    if heartbeat_monitor is not None:
+        heartbeat_monitor.update_heartbeat()
+
+    if state_manager.get_state(txn_id) is None:
+        return jsonify({"status": "error",
+                        "message": "Unknown transaction"}), 400
+
+    dispatch = {
+        MessageType.CAN_COMMIT: _handle_can_commit,
+        MessageType.PRE_COMMIT: _handle_pre_commit,
+        MessageType.DO_COMMIT:  _handle_do_commit,
+        MessageType.ABORT:      _handle_abort,
+    }
+    handler = dispatch.get(message.message_type)
+
+    if handler is None:
+        logger.warning("unknown_message_type",
+                       message_type=message.message_type.value)
+        return jsonify({"status": "error",
+                        "message": f"Unknown type: {message.message_type.value}"}), 400
+
+    response_msg = handler(message)
+
+    # If the transaction reached a final state, the clock stops.
+    if heartbeat_monitor is not None and state_manager.is_final(txn_id):
+        heartbeat_monitor.mark_transaction_done()
+
+    return jsonify({
+        "status": "success",
+        "participant_id": participant_id,
+        "response": response_msg.to_dict() if response_msg else None,
+        "current_state": state_manager.get_state(txn_id),
+    }), 200
+
+
+# ------------------------------------------------------------------
+# Phase handlers
+# ------------------------------------------------------------------
+
+def _handle_can_commit(message: Message) -> Message:
+    """Phase 1 — vote YES and move to READY."""
+    txn_id = message.transaction_id
+
+    success = state_manager.transition(
+        txn_id, "READY", reason="voted YES to CAN_COMMIT")
+
+    if success:
+        vote = MessageType.YES
+    else:
+        # Unexpected state — vote NO and abort defensively
+        vote = MessageType.NO
+        state_manager.transition(txn_id, "ABORT",
+                                 reason="invalid transition; voting NO")
+
+    logger.info("voted", participant_id=participant_id,
+                vote=vote.value, txn_id=txn_id[:8])
+
+    return Message(
+        transaction_id=txn_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=vote,
+        state=state_manager.get_state(txn_id),
     )
-    
-    app.run(host=host, port=port, debug=True)
 
 
-if __name__ == '__main__':
-    # Run participant_1 on port 5001
+def _handle_pre_commit(message: Message) -> Message:
+    """Phase 2 — move to PRE_COMMIT and ACK."""
+    txn_id = message.transaction_id
+
+    state_manager.transition(
+        txn_id, "PRE_COMMIT",
+        reason="received PRE_COMMIT from coordinator")
+
+    return Message(
+        transaction_id=txn_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=state_manager.get_state(txn_id),
+    )
+
+
+def _handle_do_commit(message: Message) -> Message:
+    """Phase 3 — commit and confirm."""
+    txn_id = message.transaction_id
+
+    state_manager.transition(
+        txn_id, "COMMIT",
+        reason="received DO_COMMIT from coordinator")
+
+    logger.info("transaction_committed",
+                participant_id=participant_id, txn_id=txn_id[:8])
+
+    return Message(
+        transaction_id=txn_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=state_manager.get_state(txn_id),
+        data={"committed": True},
+    )
+
+
+def _handle_abort(message: Message) -> Message:
+    """Abort the transaction on coordinator instruction."""
+    txn_id = message.transaction_id
+
+    state_manager.transition(
+        txn_id, "ABORT",
+        reason="received ABORT from coordinator")
+
+    logger.info("transaction_aborted",
+                participant_id=participant_id, txn_id=txn_id[:8])
+
+    return Message(
+        transaction_id=txn_id,
+        sender=participant_id,
+        receiver=message.sender,
+        message_type=MessageType.ACK,
+        state=state_manager.get_state(txn_id),
+        data={"aborted": True},
+    )
+
+
+# ------------------------------------------------------------------
+# State inspection endpoints
+# ------------------------------------------------------------------
+
+@app.route("/state", methods=["GET"])
+def get_state():
+    """Return all tracked transaction states for this participant."""
+    if state_manager is None:
+        return jsonify({"status": "error",
+                        "message": "Participant not started"}), 503
+
+    return jsonify({
+        "status": "success",
+        "participant_id": participant_id,
+        "states": state_manager.all_states(),
+        "pending": state_manager.get_pending_txn_ids(),
+    }), 200
+
+
+@app.route("/peer-state", methods=["GET"])
+def get_peer_state():
+    """
+    Return state of all pending transactions.
+
+    Used during manual recovery to assess peer readiness.
+    Kept for backward compatibility; prefer /query-state/<txn_id>
+    for per-transaction queries.
+    """
+    if state_manager is None:
+        return jsonify({"status": "error",
+                        "message": "No active transaction"}), 400
+
+    pending = state_manager.get_pending_txn_ids()
+    states = {tid: state_manager.get_state(tid) for tid in pending}
+
+    return jsonify({
+        "participant_id": participant_id,
+        "pending_states": states,
+        "peer_urls": _peer_urls(),
+    }), 200
+
+
+@app.route("/query-state/<txn_id>", methods=["GET"])
+def query_state(txn_id: str):
+    """
+    Per-transaction state query used by AutoRecovery on peer participants.
+
+    Returns the current state for `txn_id`, or "UNKNOWN" if not tracked.
+    """
+    if state_manager is None:
+        return jsonify({"txn_id": txn_id, "state": "UNKNOWN"}), 200
+
+    state = state_manager.get_state(txn_id) or "UNKNOWN"
+    return jsonify({
+        "txn_id":           txn_id,
+        "participant_id":   participant_id,
+        "state":            state,
+    }), 200
+
+
+# ------------------------------------------------------------------
+# Recovery endpoint
+# ------------------------------------------------------------------
+
+@app.route("/recover", methods=["POST"])
+def trigger_recovery():
+    """
+    Manually trigger the non-blocking recovery protocol.
+
+    AutoRecovery queries configured peers (PARTICIPANT_PEERS env var)
+    and resolves all pending transactions.  No request body required.
+    """
+    if auto_recovery is None:
+        return jsonify({"status": "error",
+                        "message": "Participant not started"}), 503
+
+    logger.info("manual_recovery_triggered", participant_id=participant_id)
+    results = auto_recovery.attempt_recovery()
+
+    return jsonify({
+        "participant_id":    participant_id,
+        "recovery_attempted": True,
+        "results":           results,
+    }), 200
+
+
+# ------------------------------------------------------------------
+# Server startup
+# ------------------------------------------------------------------
+
+def run_participant(p_id: str, host: str = "127.0.0.1", port: int = 5001) -> None:
+    """
+    Initialise globals and start the Flask server.
+
+    Args:
+        p_id:  participant identifier, e.g. "participant_1"
+        host:  bind address
+        port:  listen port
+    """
+    global participant_id, state_manager, heartbeat_monitor, auto_recovery
+
+    participant_id = p_id
+
+    # State manager restores non-final transactions from SQLite on init
+    state_manager = GlobalStateManager(participant_id=p_id)
+
+    # AutoRecovery reads peer URLs from env at startup
+    peers = _peer_urls()
+    auto_recovery = AutoRecovery(
+        participant_id=p_id,
+        peer_urls=peers,
+        state_manager=state_manager,
+    )
+
+    # HeartbeatMonitor fires _on_coordinator_timeout on silence
+    heartbeat_monitor = HeartbeatMonitor(
+        participant_id=p_id,
+        heartbeat_timeout=float(os.environ.get("HEARTBEAT_TIMEOUT", "5")),
+        on_timeout_callback=_on_coordinator_timeout,
+    )
+
+    logger.info("participant_starting",
+                participant_id=p_id, host=host, port=port,
+                peers=peers)
+
+    app.run(host=host, port=port, debug=True, use_reloader=False)
+
+
+if __name__ == "__main__":
     run_participant("participant_1", port=5001)

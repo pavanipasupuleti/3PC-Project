@@ -9,7 +9,9 @@ import structlog
 from coordinator.state import CoordinatorStateManager, CoordinatorState
 from coordinator.messages import Message, MessageType, create_transaction_id
 from coordinator.leader_election import LeaderElection
+from coordinator.heartbeat import CoordinatorHeartbeat
 import requests
+import threading
 from typing import List, Dict
 import time
 from datetime import datetime
@@ -25,9 +27,12 @@ app = Flask(__name__)
 election = LeaderElection(node_id='coordinator-1')
 election.try_become_leader()
 
-# Store active transactions (in memory for now)
-# In real system, this would be in database
-active_transactions = {}
+# Heartbeat sender — keeps participants' timeout clocks from firing
+coordinator_heartbeat = CoordinatorHeartbeat(coordinator_id='coordinator-1')
+
+# Active transactions — protected by a lock for thread safety
+active_transactions: Dict = {}
+active_transactions_lock = threading.Lock()
 
 
 @app.route('/health', methods=['GET'])
@@ -97,13 +102,14 @@ def get_transaction_status(txn_id):
     
     Purpose: Check what state a transaction is in.
     """
-    if txn_id not in active_transactions:
+    with active_transactions_lock:
+        txn = active_transactions.get(txn_id)
+
+    if txn is None:
         return jsonify({
             "status": "error",
             "message": "Transaction not found"
         }), 404
-    
-    txn = active_transactions[txn_id]
     state_mgr = txn["state_manager"]
     
     return jsonify({
@@ -140,12 +146,13 @@ def execute_transaction():
     # Create new transaction
     txn_id = create_transaction_id()
     state_mgr = CoordinatorStateManager(txn_id)
-    
-    # Store transaction
-    active_transactions[txn_id] = {
-        "state_manager": state_mgr,
-        "participants": participant_urls
-    }
+
+    # Store transaction (lock protects concurrent transaction starts)
+    with active_transactions_lock:
+        active_transactions[txn_id] = {
+            "state_manager": state_mgr,
+            "participants": participant_urls,
+        }
     
     logger.info(
         "transaction_started",
@@ -178,9 +185,12 @@ def execute_3pc_protocol(txn_id: str, state_mgr: CoordinatorStateManager, partic
     Phase 2: PRE_COMMIT
     Phase 3: DO_COMMIT
     """
+    # Register participants so heartbeat thread keeps them updated
+    coordinator_heartbeat.register_participants(participant_urls)
+
     # Record transaction start
     metrics.record_transaction_start(txn_id)
-    total_start_time = time.monotonic()  # 🆕 Changed to monotonic
+    total_start_time = time.monotonic()
     
     # 🆕 Log transaction start in database
     created_at = datetime.now()
@@ -384,9 +394,8 @@ def send_can_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
             response = requests.post(
                 f"{url}/message",
                 json=message.to_dict(),
-                timeout=5
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 vote = data.get("response", {}).get("message_type", "NO")
@@ -395,10 +404,10 @@ def send_can_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
             else:
                 votes[url] = "NO"
                 logger.error("vote_failed", url=url, status=response.status_code)
-        
+
         except Exception as e:
             votes[url] = "NO"
-            logger.error("vote_timeout", url=url, error=str(e))
+            logger.error("vote_error", url=url, error=str(e))
             metrics.record_timeout()
     
     return votes
@@ -421,9 +430,8 @@ def send_pre_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
             response = requests.post(
                 f"{url}/message",
                 json=message.to_dict(),
-                timeout=5
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 ack = data.get("response", {}).get("message_type", "FAIL")
@@ -431,10 +439,10 @@ def send_pre_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
                 logger.info("ack_received", url=url, ack=ack)
             else:
                 acks[url] = "FAIL"
-        
+
         except Exception as e:
             acks[url] = "FAIL"
-            logger.error("ack_timeout", url=url, error=str(e))
+            logger.error("ack_error", url=url, error=str(e))
             metrics.record_timeout()
     
     return acks
@@ -457,18 +465,17 @@ def send_do_commit(txn_id: str, participant_urls: List[str]) -> Dict[str, str]:
             response = requests.post(
                 f"{url}/message",
                 json=message.to_dict(),
-                timeout=5
             )
-            
+
             if response.status_code == 200:
                 commits[url] = "COMMITTED"
                 logger.info("commit_received", url=url)
             else:
                 commits[url] = "FAILED"
-        
+
         except Exception as e:
             commits[url] = "FAILED"
-            logger.error("commit_timeout", url=url, error=str(e))
+            logger.error("commit_error", url=url, error=str(e))
             metrics.record_timeout()
     
     return commits
@@ -489,11 +496,10 @@ def send_abort(txn_id: str, participant_urls: List[str]):
             requests.post(
                 f"{url}/message",
                 json=message.to_dict(),
-                timeout=5
             )
             logger.info("abort_sent", url=url)
         except Exception as e:
-            logger.error("abort_failed", url=url, error=str(e))
+            logger.error("abort_error", url=url, error=str(e))
 
 
 @app.route('/leader-status', methods=['GET'])
