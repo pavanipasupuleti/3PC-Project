@@ -1,7 +1,7 @@
 # Three-Phase Commit (3PC) Protocol — Project Report
 
 **Subject:** Distributed Systems
-**Topic:** Implement Three-Phase Commit (3PC) with Network Partition Simulation and Non-Blocking Recovery
+**Topic:** Implement Three-Phase Commit (3PC) with Network Partition Simulation and Multi-Coordinator High Availability
 
 ---
 
@@ -11,89 +11,79 @@
 2. [Objective](#2-objective)
 3. [Problem Statement](#3-problem-statement)
 4. [Why 3PC Over 2PC](#4-why-3pc-over-2pc)
-5. [What Non-Blocking Means in Simple Words](#5-what-non-blocking-means-in-simple-words)
-6. [How This Project Demonstrates Non-Blocking Behavior](#6-how-this-project-demonstrates-non-blocking-behavior)
-7. [Technology Stack](#7-technology-stack)
-8. [Folder Structure](#8-folder-structure)
-9. [Key Files Explained](#9-key-files-explained)
-10. [Full Transaction Flow](#10-full-transaction-flow)
-11. [Coordinator and Participant Communication](#11-coordinator-and-participant-communication)
-12. [Leader Election Using etcd](#12-leader-election-using-etcd)
-13. [Network Partition Simulation with Toxiproxy](#13-network-partition-simulation-with-toxiproxy)
-14. [Automatic Recovery After Coordinator Failure](#14-automatic-recovery-after-coordinator-failure)
-15. [SQLite Persistence](#15-sqlite-persistence)
-16. [Thread Safety and Race Condition Fixes](#16-thread-safety-and-race-condition-fixes)
-17. [Non-Blocking Recovery During Network Partition](#17-non-blocking-recovery-during-network-partition)
-18. [Testing Strategy](#18-testing-strategy)
-19. [Architecture Explanation](#21-architecture-explanation)
-20. [How to Run the Project](#22-how-to-run-the-project)
-21. [Example Commands and Expected Outputs](#23-example-commands-and-expected-outputs)
-22. [Conclusion](#24-conclusion)
+5. [Technology Stack](#5-technology-stack)
+6. [Folder Structure](#6-folder-structure)
+7. [Key Files Explained](#7-key-files-explained)
+8. [Full Transaction Flow](#8-full-transaction-flow)
+9. [Coordinator and Participant Communication](#9-coordinator-and-participant-communication)
+10. [Leader Election Using etcd](#10-leader-election-using-etcd)
+11. [Network Partition Simulation with Toxiproxy](#11-network-partition-simulation-with-toxiproxy)
+12. [SQLite Persistence](#12-sqlite-persistence)
+13. [Thread Safety](#13-thread-safety)
+14. [Testing Strategy](#14-testing-strategy)
+15. [Architecture](#15-architecture)
+16. [How to Run the Project](#16-how-to-run-the-project)
+17. [Example Commands and Expected Outputs](#17-example-commands-and-expected-outputs)
+18. [Conclusion](#18-conclusion)
 
 ---
 
 ## 1. Project Overview
 
-This project is a full working implementation of the **Three-Phase Commit (3PC)** distributed transaction protocol. It is built using Python and Flask, runs inside Docker containers, and simulates real-world distributed system scenarios — including network partitions, coordinator failure, and automatic recovery.
+This project is a full working implementation of the **Three-Phase Commit (3PC)** distributed transaction protocol. It is built using Python and Flask, runs inside Docker containers, and simulates real-world distributed system scenarios including network partitions and coordinator failure with automatic leader re-election.
 
 The system consists of:
 
-- **One Coordinator** — the leader that drives the transaction forward
-- **Three Participants** — the nodes that vote, acknowledge, and commit/abort
-- **etcd** — a distributed key-value store used for leader election
+- **Three Coordinators** — only the etcd leader executes transactions; the other two are hot standbys
+- **Three Participants** — nodes that vote, acknowledge, and commit/abort
+- **etcd** — distributed key-value store used for leader election across coordinators
 - **Toxiproxy** — a tool that blocks network traffic to simulate partitions
 - **A Dashboard** — a live web UI showing transaction metrics and charts
 - **SQLite databases** — for persisting transaction states across restarts
 
-The project is not just theoretical — every component is coded, running, and testable. Transactions can be triggered via HTTP, partitions can be injected on demand, and automatic recovery happens without any human intervention.
+Every component is coded, running, and testable. Transactions are triggered via HTTP, partitions are injected on demand, and coordinator failover happens automatically via etcd lease expiry.
 
 ---
 
 ## 2. Objective
 
-The main objectives of this project are:
-
 1. Implement the complete Three-Phase Commit protocol from scratch in Python
-2. Show that 3PC can resolve pending transactions **without** waiting for a failed coordinator to come back (non-blocking property)
+2. Demonstrate high availability using three coordinator nodes with etcd leader election
 3. Simulate network partitions using Toxiproxy to verify the system handles failures correctly
 4. Persist transaction state to disk so participants survive crashes and restarts
-5. Demonstrate leader election so only one coordinator runs at a time
-6. Build an observable system with a live dashboard, structured logs, and metrics
+5. Build an observable system with a live dashboard, structured logs, and metrics
 
 ---
 
 ## 3. Problem Statement
 
-In a distributed system, multiple computers (nodes) must agree on whether to commit or abort a shared operation. For example, transferring money between two bank accounts hosted on different servers — both servers must either apply the change or neither should.
+In a distributed system, multiple nodes must agree on whether to commit or abort a shared operation. For example, transferring money between two bank accounts on different servers — both must apply the change or neither should.
 
 The challenge is:
 
 > **What happens if the coordinator crashes in the middle of the process?**
 
-With naive approaches, participants are left in an uncertain state — they do not know if they should commit or abort. They are **blocked**, waiting indefinitely for the coordinator to come back. This is unacceptable in real systems where availability matters.
+With naive approaches, participants are left in an uncertain state — they do not know whether to commit or abort, and are **blocked** waiting indefinitely for the coordinator to recover.
 
-This project addresses exactly this problem by implementing 3PC, which introduces an extra phase that allows participants to make a safe decision on their own when the coordinator is unreachable.
+This project addresses this through two mechanisms:
+1. **3PC's PRE_COMMIT phase** — creates a safe intermediate state that eliminates the blocking window
+2. **etcd leader election** — if the active coordinator dies, a standby takes over within ~10 seconds
 
 ---
 
 ## 4. Why 3PC Over 2PC
 
-### Two-Phase Commit (2PC) — The Older Protocol
+### Two-Phase Commit (2PC) — The Problem
 
 2PC has two phases:
-
 1. **Phase 1 (Voting):** Coordinator asks all participants "Can you commit?" — they reply YES or NO
-2. **Phase 2 (Decision):** If all say YES, coordinator sends COMMIT; otherwise sends ABORT
+2. **Phase 2 (Decision):** If all say YES, coordinator sends COMMIT; otherwise ABORT
 
-**The big problem with 2PC:**
-
-Imagine a participant has voted YES and is now waiting for the coordinator to send COMMIT or ABORT. If the coordinator crashes at this exact moment, the participant is **stuck**. It cannot commit on its own (maybe another participant voted NO) and it cannot abort on its own (maybe the coordinator already sent COMMIT to others). The participant has to wait until the coordinator recovers — potentially forever.
-
-This is called the **blocking problem**.
+**The blocking problem:** A participant that voted YES and is waiting for the coordinator's decision is completely stuck if the coordinator crashes at that point. It cannot commit (maybe another participant voted NO) and cannot abort (maybe the coordinator already sent COMMIT to others). It must wait until the coordinator recovers.
 
 ### Three-Phase Commit (3PC) — The Solution
 
-3PC adds one extra phase in the middle:
+3PC adds a PRE_COMMIT phase in the middle:
 
 | Phase | 2PC | 3PC |
 |-------|-----|-----|
@@ -101,124 +91,62 @@ This is called the **blocking problem**.
 | Phase 2 | Decision (COMMIT/ABORT) | Pre-commit (PRE_COMMIT) |
 | Phase 3 | — | Final commit (DO_COMMIT) |
 
-The key insight is the **PRE_COMMIT** phase. Once a participant enters PRE_COMMIT, it knows that:
-- Every other participant voted YES (otherwise coordinator would have aborted already)
-- It is now **safe to commit**, even if the coordinator dies
-
-So if the coordinator crashes after PRE_COMMIT, the participant can ask its peers "Did you also reach PRE_COMMIT?" and if yes, everyone can commit together without the coordinator.
+Once a participant enters PRE_COMMIT, it knows every other participant voted YES. If the coordinator dies after this point, the new coordinator elected via etcd knows it can safely resume Phase 3 — no participant is in an ambiguous state.
 
 ### Summary Table
 
 | Feature | 2PC | 3PC |
 |---------|-----|-----|
 | Number of phases | 2 | 3 |
-| Blocking on coordinator failure | YES (blocked) | NO (can recover) |
-| Needs coordinator to commit | Always | Only before PRE_COMMIT |
+| Blocking on coordinator failure | YES | NO (new leader resumes) |
 | Communication rounds | 2 | 3 |
-| Complexity | Simple | Moderate |
-| Used when | Coordinator failure is rare | High availability needed |
+| High availability | Manual failover | Automatic via etcd |
 
 ---
 
-## 5. What Non-Blocking Means in Simple Words
-
-Think of it like a group project deadline submission:
-
-**2PC (Blocking):**
-The professor (coordinator) tells everyone to submit. Each student (participant) prepares their submission. They all wait for the professor to officially say "Submit now!" If the professor disappears without saying this, every student is stuck holding their submission, not knowing whether to submit or not.
-
-**3PC (Non-Blocking):**
-The professor first announces "Everyone get ready to submit" (PRE_COMMIT). Once each student hears this, they know everyone else is also ready. If the professor now disappears, the students can look at each other and say "We're all ready, let's just submit!" — they do not need the professor anymore.
-
-In technical terms:
-
-> **Non-blocking** means that participants can always reach a final decision (COMMIT or ABORT) in a bounded amount of time, even if the coordinator fails — as long as enough peers are reachable.
-
----
-
-## 6. How This Project Demonstrates Non-Blocking Behavior
-
-The non-blocking property is demonstrated through four connected components:
-
-### Step 1: Coordinator sends heartbeats
-The coordinator sends a `POST /heartbeat` ping to all participants every 2 seconds. This tells participants "I am still alive."
-
-### Step 2: HeartbeatMonitor detects silence
-Each participant runs a background thread (`HeartbeatMonitor`) that checks every 0.5 seconds. If no heartbeat arrives for 5 seconds while a transaction is active, it assumes the coordinator is dead.
-
-### Step 3: AutoRecovery kicks in
-When silence is detected, `AutoRecovery.attempt_recovery()` is automatically called. It:
-1. Finds all pending (non-final) transactions
-2. For each one, checks the participant's own state
-3. If in PRE_COMMIT → queries peers to make a collective decision
-4. If in INIT or READY → aborts immediately (coordinator died before everyone was ready)
-
-### Step 4: Peer consensus decides the outcome
-The decision rules are based on Skeen's 1981 paper:
-
-```
-Any peer has COMMITTED  →  I must COMMIT too
-Any peer has ABORTED    →  I must ABORT too
-Any peer is in INIT/READY → ABORT (not everyone was ready)
-All reachable peers in PRE_COMMIT → COMMIT autonomously
-All peers unreachable   →  Wait (UNKNOWN), retry later
-```
-
-This means the system **never gets permanently stuck**. If the coordinator dies, participants resolve the transaction themselves. This is exactly the non-blocking property of 3PC.
-
----
-
-## 7. Technology Stack
-
-### Overview Table
+## 5. Technology Stack
 
 | Technology | Role in This Project |
 |------------|---------------------|
 | Python 3 | Core programming language for all services |
-| Flask | HTTP server for coordinator, participants, and dashboard |
+| Flask | HTTP server for coordinators, participants, and dashboard |
 | Docker | Packages each service into an isolated container |
-| Docker Compose | Starts and wires all containers together |
+| Docker Compose | Starts and wires all 9 containers together |
 | SQLite | Persists transaction state to disk |
-| etcd | Distributed leader election for the coordinator |
+| etcd | Distributed leader election across 3 coordinator nodes |
 | Toxiproxy | Simulates network partitions by blocking traffic |
-| structlog | Structured, readable JSON-style logging |
-| threading | Background threads for heartbeats and monitors |
-| REST APIs | Communication protocol between all services |
+| structlog | Structured JSON-style logging across all services |
+| threading | Background threads for heartbeats, lease renewal, monitors |
+| REST/JSON | Communication protocol between all services |
 
-### Why Each Was Chosen
+**Python** — Fast to develop, excellent HTTP library support, no compilation. Ideal for a research implementation.
 
-**Python** — Easy to read, fast to develop, excellent HTTP library support with `requests`, no compilation needed. Ideal for a research/academic implementation.
+**Flask** — Lightweight HTTP framework. Each service becomes a small web server focused on protocol logic.
 
-**Flask** — Lightweight HTTP framework. Each service (coordinator, participant, dashboard) becomes a small web server. No heavy framework needed — Flask keeps the focus on protocol logic.
+**Docker** — Simulates a real distributed system on one machine by giving each service its own isolated network address and filesystem.
 
-**Docker** — Real distributed systems run on separate machines. Docker simulates this on one laptop by giving each service its own isolated network address and filesystem. Without Docker, all services would share the same process and the "distributed" aspect would be fake.
+**Docker Compose** — Defines all 9 services in one file, started with `make up`.
 
-**Docker Compose** — Writing `docker run` commands for 7 services manually is tedious and error-prone. Compose defines everything in one `docker-compose.yml` file and starts it all with `make up`.
+**SQLite** — File-based database. No separate server needed. Each participant writes its transaction state to a `.db` file so that if the container restarts, it picks up from where it left off.
 
-**SQLite** — A simple file-based database. No separate database server needed. Each participant writes its transaction state to a `.db` file so that if the container crashes and restarts, it picks up from where it left off. This is the Write-Ahead Log (WAL) pattern.
+**etcd** — Distributed key-value store designed for coordination (used by Kubernetes). Used for **leader election** — only the coordinator holding the etcd lock executes transactions.
 
-**etcd** — A distributed key-value store designed specifically for coordination in distributed systems (used by Kubernetes). Used here for **leader election** — only the coordinator that holds the etcd lock can execute transactions. This prevents two coordinators from running at the same time.
+**Toxiproxy** — Programmable reverse proxy by Shopify. Routes traffic through a controllable proxy so any participant can be partitioned instantly via the admin API.
 
-**Toxiproxy** — A programmable network proxy from Shopify. By routing traffic through Toxiproxy, we can disable a proxy via its REST API to instantly "cut" the network connection to any participant. This simulates real-world network partitions without actually modifying firewall rules.
+**structlog** — Every log line includes key-value pairs (`transaction_id`, `phase`, `state`), making logs machine-readable and easy to trace.
 
-**structlog** — Every log line includes structured key-value pairs (e.g., `transaction_id`, `phase`, `state`). This makes logs machine-readable and easy to search, unlike plain `print()` statements.
+**threading** — Used for: coordinator heartbeat sender, participant heartbeat monitor, etcd lease renewal, and protecting shared data with `threading.Lock`.
 
-**threading** — Python's built-in thread library. Used for:
-- Background heartbeat sender in the coordinator
-- Background heartbeat monitor in each participant
-- Protecting shared data with `threading.Lock`
-- Leader election lease renewal
-
-**REST APIs** — All communication is done via HTTP POST/GET requests with JSON bodies. This is simple, language-agnostic, and easy to test with `curl` or `requests`.
+**REST/JSON** — All communication is HTTP POST/GET with JSON bodies — simple, language-agnostic, and easy to test with `curl`.
 
 ---
 
-## 8. Folder Structure
+## 6. Folder Structure
 
 ```
 3PC-Project/
 |
-|-- coordinator/           # The coordinator service
+|-- coordinator/           # The coordinator service (3 instances, same code)
 |   |-- __init__.py
 |   |-- server.py          # Flask HTTP server + 3PC protocol orchestration
 |   |-- state.py           # Coordinator state machine (WAIT, PRE_COMMIT, COMMIT, ABORT)
@@ -231,11 +159,10 @@ This means the system **never gets permanently stuck**. If the coordinator dies,
 |   |-- server.py          # Flask HTTP server + phase handlers
 |   |-- state_manager.py   # Thread-safe multi-transaction state tracker
 |   |-- timeout_detector.py# Detects coordinator silence (HeartbeatMonitor)
-|   |-- auto_recovery.py   # Autonomous recovery via peer consensus (AutoRecovery)
 |
 |-- storage/               # Database layer
-|   |-- database.py        # Coordinator's SQLite store (transactions + events)
-|   |-- participant_database.py  # Participant's SQLite store (per-txn states)
+|   |-- database.py        # Coordinator SQLite store (transactions + events)
+|   |-- participant_database.py  # Participant SQLite store (per-txn states)
 |
 |-- dashboard/             # Live web dashboard
 |   |-- app.py             # Flask server serving charts and metrics
@@ -244,123 +171,105 @@ This means the system **never gets permanently stuck**. If the coordinator dies,
 |
 |-- tests/                 # All test files
 |   |-- __init__.py
-|   |-- test_state.py           # Unit tests for coordinator state machine
-|   |-- test_participant_state.py # Unit tests for participant state manager
-|   |-- test_partition_recovery.py # Integration tests (requires Docker stack)
+|   |-- test_state.py                 # Unit tests for coordinator state machine
+|   |-- test_participant_state.py     # Unit tests for participant state manager
+|   |-- test_partition_recovery.py   # Integration tests (requires Docker stack)
 |
 |-- scripts/               # Utility scripts
 |   |-- inject_partition.py # CLI tool to control Toxiproxy partitions
 |
 |-- metrics/               # Metrics collection
-|   |-- collector.py       # In-memory metrics (commit rate, latencies)
+|   |-- collector.py       # In-memory metrics (commit rate, latencies, failures)
 |
+|-- docs/                  # Protocol diagrams (PNG)
 |-- data/                  # SQLite database files (created at runtime)
-|-- docker-compose.yml     # Defines all 7 services and their configuration
+|-- docker-compose.yml     # Defines all 9 services and their configuration
 |-- Dockerfile             # How to build the Python application image
-|-- Makefile               # Shortcuts for build, run, test, clean
+|-- Makefile               # Shortcuts for build, run, test, clean, failover
 |-- requirements.txt       # Python package dependencies
 ```
 
-### What Each Folder Does
-
-**`coordinator/`** — Contains everything the coordinator needs. The coordinator is the "boss" of the transaction. It starts the process, collects votes, sends decisions, and keeps participants updated via heartbeats.
-
-**`participant/`** — Contains everything each participant needs. Three Docker containers all run the same code but with different IDs and ports. Participants vote, acknowledge, and commit/abort. They also recover autonomously if the coordinator dies.
-
-**`storage/`** — The database layer. Completely separate from the business logic. Both the coordinator and participants write to SQLite here. Keeping this in its own folder makes it easy to swap out for a different database later.
-
-**`dashboard/`** — A web page at `http://localhost:8000` that shows live stats: total transactions, commit rate, phase latencies, and a donut chart showing committed vs. aborted.
-
-**`tests/`** — All tests in one place. Unit tests run without Docker. Integration tests require the full Docker stack and Toxiproxy.
-
-**`scripts/`** — The `inject_partition.py` script is a command-line tool to set up, enable, or disable Toxiproxy proxies. Used both manually and inside integration tests.
-
-**`metrics/`** — A simple in-memory counter that tracks commit counts, abort counts, and phase timings. Data is served to the dashboard via the `/metrics` endpoint.
-
 ---
 
-## 9. Key Files Explained
+## 7. Key Files Explained
 
 ### `coordinator/server.py`
 
-This is the brain of the coordinator. It does three things:
-
-1. **Serves HTTP endpoints:** `/health`, `/execute-transaction`, `/leader-status`, `/metrics`
-2. **Runs the 3PC protocol:** Calls `execute_3pc_protocol()` which sends CAN_COMMIT, PRE_COMMIT, and DO_COMMIT in sequence
-3. **Tracks active transactions:** A thread-safe dictionary (`active_transactions`) keyed by transaction ID
-
-Important design decision: Protocol messages (CAN_COMMIT, PRE_COMMIT, DO_COMMIT) have **no timeout**. This is intentional — the coordinator waits as long as it takes for each participant to respond. Only admin calls like heartbeats use a 1-second timeout.
+The brain of the coordinator. It:
+1. Reads `NODE_ID` from the environment (`coordinator-1`, `coordinator-2`, or `coordinator-3`)
+2. Participates in etcd leader election on startup
+3. Serves `/execute-transaction` — only processes requests if `election.is_leader` is True (returns 503 otherwise)
+4. Runs `execute_3pc_protocol()` which sends CAN_COMMIT → PRE_COMMIT → DO_COMMIT in sequence
+5. Records metrics and saves every transaction to SQLite
 
 ---
 
 ### `coordinator/leader_election.py`
 
-This file makes the coordinator a "distributed" coordinator rather than a single point of failure.
+Makes the coordinator cluster highly available.
 
 **How it works:**
-1. On startup, the coordinator connects to etcd
-2. It tries to write its ID to the key `/3pc/leader` using a **Compare-And-Swap (CAS)** transaction
-3. CAS only succeeds if the key does not already exist — so only one coordinator wins
-4. The winner gets a 10-second lease. It renews the lease every 5 seconds with a background heartbeat thread
-5. If the lease expires (coordinator dies), etcd automatically deletes the key
-6. If etcd itself is unreachable, the coordinator **assumes leadership** — the system keeps working, just without distributed election
+1. On startup, each coordinator connects to etcd
+2. Tries to write its `NODE_ID` to the key `/3pc/leader` using a **Compare-And-Swap (CAS)** transaction — succeeds only if the key does not already exist
+3. The winner gets a **10-second lease** renewed every **5 seconds** by a background thread
+4. If the leader crashes, its lease expires in ≤10 seconds and etcd deletes the key
+5. A standby coordinator calls `try_become_leader()` and wins the next election
 
-**Graceful degradation** is an important feature: the protocol never stops because etcd is down.
+**Graceful fallback:** If etcd itself is unreachable, the coordinator assumes leadership so transactions are never blocked by an infrastructure failure.
 
 ---
 
 ### `coordinator/heartbeat.py`
 
-A background thread that runs continuously inside the coordinator process.
+A background daemon thread inside each coordinator.
 
-Every 2 seconds, it sends `POST /heartbeat` to all registered participant URLs. This keeps each participant's internal clock from triggering a "coordinator is dead" false alarm.
-
-Participants are registered dynamically when a transaction starts, so the heartbeat list always reflects the current set of participants.
+Every 2 seconds, sends `POST /heartbeat` to all registered participant URLs. This resets each participant's internal timeout clock, preventing false "coordinator is dead" alarms while the coordinator is healthy.
 
 ---
 
 ### `participant/timeout_detector.py` — HeartbeatMonitor
 
-This runs inside each participant as a background daemon thread.
+Runs inside each participant as a background daemon thread.
 
-**Key logic:**
-- Checks every 0.5 seconds whether a heartbeat was received recently
-- Only fires the timeout when a transaction is **actively in-flight** (prevents false alarms between transactions)
-- When timeout fires, it calls `_on_coordinator_timeout()` once and then resets (prevents repeated spam)
-- Default timeout: 5 seconds (configurable via `HEARTBEAT_TIMEOUT` environment variable)
+- Checks every 0.5 seconds whether a heartbeat arrived recently
+- Only fires when a transaction is **actively in-flight** (prevents false alarms between transactions)
+- Default timeout: 5 seconds (configurable via `HEARTBEAT_TIMEOUT` env var)
+- When timeout fires, calls `_on_coordinator_timeout()` — which logs the event so the new coordinator can pick up
 
 ```
-Timeline:
-t=0s  Transaction starts → mark_transaction_active()
-t=2s  Coordinator heartbeat received → update_heartbeat()
-t=4s  Coordinator CRASHES (no more heartbeats)
-t=9s  5 seconds of silence detected → fire callback
-t=9s+ AutoRecovery.attempt_recovery() runs
+t=0s   Transaction starts
+t=2s   Coordinator heartbeat received
+t=4s   Coordinator CRASHES
+t=9s   5-second silence window expires → timeout fires
+t=9s+  New coordinator (etcd winner) resumes Phase 3
 ```
 
 ---
 
-### `participant/auto_recovery.py` — AutoRecovery
+### `participant/state_manager.py` — GlobalStateManager
 
-This is the core of the non-blocking property. It runs when the HeartbeatMonitor fires.
+Manages state for **multiple concurrent transactions** in memory, with every change persisted to SQLite.
 
-**Logic for each pending transaction:**
-
+Valid state transitions enforced:
 ```
-My state is INIT or READY?
-  → Abort immediately (coordinator died before PRE_COMMIT phase)
-
-My state is PRE_COMMIT?
-  → Query all peer participants for their state
-  → Apply decision rules:
-      Any peer COMMITTED → I COMMIT
-      Any peer ABORTED   → I ABORT
-      Any peer in INIT/READY → I ABORT
-      All reachable peers in PRE_COMMIT → I COMMIT
-      All peers unreachable → UNKNOWN (wait, try later)
+INIT → READY → PRE_COMMIT → COMMIT
+                           → ABORT
+INIT → ABORT
+READY → ABORT
 ```
 
-Only one recovery run executes at a time (non-reentrant lock), preventing race conditions when timeout fires multiple times.
+Invalid transitions are rejected and logged. On startup, `_restore_from_db()` reloads all non-final transactions from SQLite so a restarted participant can continue from its last known state.
+
+---
+
+### `storage/database.py` — TransactionStore (Coordinator DB)
+
+The coordinator's SQLite database tracking:
+
+1. **`transactions` table** — one row per transaction: status, participant count, per-phase latencies, timestamps
+2. **`transaction_events` table** — full event log (state transitions, phase completions, failures)
+
+This feeds the dashboard charts and provides a complete audit trail.
 
 ---
 
@@ -368,7 +277,7 @@ Only one recovery run executes at a time (non-reentrant lock), preventing race c
 
 SQLite database for each participant.
 
-**Schema:**
+Schema:
 ```sql
 CREATE TABLE participant_transactions (
     txn_id         TEXT PRIMARY KEY,
@@ -379,50 +288,16 @@ CREATE TABLE participant_transactions (
 )
 ```
 
-**Key operations:**
-- `save_state()` — writes on every state transition (INIT → READY → PRE_COMMIT → COMMIT/ABORT)
-- `get_pending()` — returns all transactions not yet in COMMIT or ABORT
-- `load_state()` — reads a single transaction's state
-- On startup, `GlobalStateManager` calls `get_pending()` to restore in-progress transactions
-
----
-
-### `participant/state_manager.py` — GlobalStateManager
-
-Manages state for **multiple concurrent transactions** in memory, with every change persisted to SQLite.
-
-**Valid state transitions enforced:**
-```
-INIT → READY → PRE_COMMIT → COMMIT
-                          → ABORT
-INIT → ABORT
-READY → ABORT
-```
-
-Invalid transitions are rejected and logged as errors. This prevents protocol bugs from putting a participant in a contradictory state.
-
-On startup, the manager calls `_restore_from_db()` which reloads all non-final transactions from SQLite. This means if a participant container restarts mid-transaction, it picks up from its last known state and can continue recovery.
-
----
-
-### `storage/database.py` — TransactionStore (Coordinator DB)
-
-The coordinator's SQLite database, tracking:
-
-1. **`transactions` table** — one row per transaction with status, participant count, and per-phase latencies
-2. **`transaction_events` table** — detailed event log (state transitions, phase completions, failures)
-
-This data feeds the dashboard charts and gives a complete audit trail of every transaction.
+Every state transition calls `save_state()` before returning. On startup, `get_pending()` restores in-progress transactions.
 
 ---
 
 ### `scripts/inject_partition.py`
 
-A command-line tool for controlling Toxiproxy. Uses the Toxiproxy REST API at `http://localhost:8474`.
+CLI tool for controlling Toxiproxy via its REST API at `http://localhost:8474`.
 
-**Commands:**
 ```
-setup          Create proxy entries for participant-1, participant-2, participant-3
+setup          Create proxies for participant-1, participant-2, participant-3
 status         Show which proxies are enabled/disabled
 1 on           Disable proxy for participant1 (network partition)
 1 off          Re-enable proxy for participant1 (restore connection)
@@ -430,20 +305,16 @@ restore        Re-enable all three proxies
 latency 1 200  Inject 200ms one-way delay to participant1
 ```
 
-Internally, `partition(id, block=True)` posts to `/proxies/{name}` with `"enabled": false`. Toxiproxy drops all packets to that upstream address when the proxy is disabled.
-
 ---
 
-## 10. Full Transaction Flow
+## 8. Full Transaction Flow
 
 ### Phase 0: Initialization
 
-Before the 3PC phases begin, the coordinator initializes each participant:
-
 ```
-Coordinator → POST /init-transaction  → Participant 1
-Coordinator → POST /init-transaction  → Participant 2
-Coordinator → POST /init-transaction  → Participant 3
+Coordinator → POST /init-transaction → Participant 1
+Coordinator → POST /init-transaction → Participant 2
+Coordinator → POST /init-transaction → Participant 3
 ```
 
 Each participant creates a new transaction entry in state `INIT`.
@@ -452,58 +323,37 @@ Each participant creates a new transaction entry in state `INIT`.
 
 ### Phase 1: CAN_COMMIT (Voting)
 
-The coordinator asks each participant: "Can you commit this transaction?"
-
 ```
 Coordinator (state: WAIT)
-    → POST /message {type: CAN_COMMIT} → Participant 1
-    → POST /message {type: CAN_COMMIT} → Participant 2
-    → POST /message {type: CAN_COMMIT} → Participant 3
-
-Participants respond:
-    Participant 1 → YES  (transitions to READY)
-    Participant 2 → YES  (transitions to READY)
-    Participant 3 → YES  (transitions to READY)
+    → POST /message {type: CAN_COMMIT} → Participant 1  → YES (→ READY)
+    → POST /message {type: CAN_COMMIT} → Participant 2  → YES (→ READY)
+    → POST /message {type: CAN_COMMIT} → Participant 3  → YES (→ READY)
 ```
 
-If **any participant** votes NO (or is unreachable), the coordinator sends ABORT to all and the transaction ends.
+If **any** participant votes NO or is unreachable, coordinator sends ABORT to all.
 
 ---
 
 ### Phase 2: PRE_COMMIT (Prepare)
 
-All voted YES, so the coordinator tells everyone to prepare:
-
 ```
 Coordinator (state: PRE_COMMIT)
-    → POST /message {type: PRE_COMMIT} → Participant 1
-    → POST /message {type: PRE_COMMIT} → Participant 2
-    → POST /message {type: PRE_COMMIT} → Participant 3
-
-Participants respond:
-    Participant 1 → ACK  (transitions to PRE_COMMIT)
-    Participant 2 → ACK  (transitions to PRE_COMMIT)
-    Participant 3 → ACK  (transitions to PRE_COMMIT)
+    → POST /message {type: PRE_COMMIT} → Participant 1  → ACK (→ PRE_COMMIT)
+    → POST /message {type: PRE_COMMIT} → Participant 2  → ACK (→ PRE_COMMIT)
+    → POST /message {type: PRE_COMMIT} → Participant 3  → ACK (→ PRE_COMMIT)
 ```
 
-**This phase is the safety checkpoint.** Once a participant is in PRE_COMMIT, it knows everyone voted YES. If the coordinator dies now, the participant can safely commit on its own.
+**Safety checkpoint.** Once a participant is in PRE_COMMIT, every participant has voted YES. The new coordinator can safely resume from here if the active one dies.
 
 ---
 
 ### Phase 3: DO_COMMIT (Final Commit)
 
-All acknowledged, so the coordinator sends the final commit:
-
 ```
 Coordinator (state: COMMIT)
-    → POST /message {type: DO_COMMIT} → Participant 1
-    → POST /message {type: DO_COMMIT} → Participant 2
-    → POST /message {type: DO_COMMIT} → Participant 3
-
-Participants:
-    Participant 1 → COMMITTED  (transitions to COMMIT)
-    Participant 2 → COMMITTED  (transitions to COMMIT)
-    Participant 3 → COMMITTED  (transitions to COMMIT)
+    → POST /message {type: DO_COMMIT} → Participant 1  → COMMITTED
+    → POST /message {type: DO_COMMIT} → Participant 2  → COMMITTED
+    → POST /message {type: DO_COMMIT} → Participant 3  → COMMITTED
 ```
 
 Transaction complete. All state saved to SQLite. Dashboard updated.
@@ -513,40 +363,24 @@ Transaction complete. All state saved to SQLite. Dashboard updated.
 ### State Diagram
 
 ```
-                    +-----------+
-                    |   INIT    |  <- Transaction registered
-                    +-----------+
-                         |
-                   CAN_COMMIT sent
-                         |
-                    +-----------+
-    ABORT <---------|   WAIT    |  <- Coordinator waiting for votes
-                    +-----------+
-                         |
-                   All votes YES
-                         |
-                    +------------+
-    ABORT <---------|  PRE_COMMIT |  <- PRE_COMMIT sent to all
-                    +------------+
-                         |
-                   All ACKs received
-                         |
-                    +-----------+
-                    |  COMMIT   |  <- DO_COMMIT sent, done
-                    +-----------+
-```
+Coordinator:
+  INIT → WAIT → PRE_COMMIT → COMMIT
+                  ↓               ↓
+                ABORT          ABORT (if ACKs fail)
 
-Participant state follows a parallel path: INIT → READY → PRE_COMMIT → COMMIT (or ABORT at any step).
+Participant:
+  INIT → READY → PRE_COMMIT → COMMIT
+    ↓       ↓         ↓
+  ABORT   ABORT     ABORT
+```
 
 ---
 
-## 11. Coordinator and Participant Communication
+## 9. Coordinator and Participant Communication
 
-All communication is done over HTTP using JSON messages.
+All communication is HTTP with JSON bodies.
 
 ### Message Format
-
-Every protocol message has this structure:
 
 ```json
 {
@@ -555,97 +389,80 @@ Every protocol message has this structure:
     "receiver": "http://participant1:5001",
     "message_type": "CAN_COMMIT",
     "state": "WAIT",
-    "timestamp": "2024-01-01T10:00:00",
+    "timestamp": 1700000000.0,
     "data": {}
 }
 ```
 
-### Endpoints Used
+### Endpoints
 
 | Service | Endpoint | Purpose |
 |---------|----------|---------|
 | Coordinator | `POST /execute-transaction` | Start a full 3PC transaction |
-| Coordinator | `GET /leader-status` | Check if this node is the leader |
+| Coordinator | `GET /leader-status` | Check if this node is the etcd leader |
 | Coordinator | `GET /health` | Health check |
+| Coordinator | `GET /metrics` | Metrics snapshot |
 | Participant | `POST /init-transaction` | Register a new transaction |
 | Participant | `POST /message` | Receive CAN_COMMIT, PRE_COMMIT, DO_COMMIT, ABORT |
 | Participant | `POST /heartbeat` | Receive liveness ping from coordinator |
-| Participant | `GET /query-state/<txn_id>` | Return state for a specific transaction (used by peers during recovery) |
-| Participant | `POST /recover` | Manually trigger recovery |
+| Participant | `GET /query-state/<txn_id>` | Return state for a specific transaction |
 | Participant | `GET /state` | Return all tracked transaction states |
 
-### Important: No Timeout on Protocol Messages
-
-Protocol messages (`/message` endpoint calls) have **no timeout**. The coordinator waits indefinitely for each participant to respond. This is correct behavior — the protocol should not give up prematurely. Only admin calls (heartbeats, health checks) use short timeouts (1-5 seconds).
+Protocol messages (`/message`) have **no timeout** — the coordinator waits as long as needed. Only admin calls (heartbeats, health checks) use short timeouts (1–5 seconds).
 
 ---
 
-## 12. Leader Election Using etcd
+## 10. Leader Election Using etcd
 
-### Why Leader Election?
+### Why Three Coordinators?
 
-In a production system, you might want to run multiple coordinator instances for high availability. Without leader election, two coordinators could both try to run the same transaction simultaneously, causing conflicts.
+A single coordinator is a single point of failure. With three coordinators, if one dies, a standby is elected within ~10 seconds and begins serving transactions — no manual intervention required.
 
-Leader election ensures that at any point in time, **exactly one coordinator** is the active leader.
-
-### How It Works in This Project
+### How It Works
 
 ```
-                    +-------+
-                    | etcd  |
-                    +-------+
-                        |
-         Coordinator tries to write key /3pc/leader
-                        |
-              CAS (Compare-And-Swap):
-              "Write my ID only if key doesn't exist"
-                        |
-              +----Yes----+----No----+
-              |                     |
-        Key was empty          Key exists
-        (I win the election)   (Someone else is leader)
-              |                     |
-        is_leader = True      is_leader = False
-        Start lease renewal   Enter standby mode
+On startup, each coordinator:
+    → Connects to etcd at :2379
+    → Attempts CAS: write NODE_ID to /3pc/leader only if key does not exist
+    → Winner: is_leader = True, starts 10s lease, renews every 5s
+    → Losers: is_leader = False, enter standby
+
+On coordinator-1 crash:
+    → Heartbeat thread stops
+    → etcd lease expires (≤10s)
+    → etcd deletes /3pc/leader
+    → coordinator-2 or coordinator-3 wins next CAS
+    → New leader starts serving transactions
 ```
 
-### Lease and Heartbeat
+### Lease and Heartbeat Constants
 
-- The winning coordinator gets a **10-second lease** on the etcd key
-- A background thread renews the lease every **5 seconds**
-- If the coordinator crashes, the lease expires in 10 seconds and etcd deletes the key
-- Another standby coordinator can then win the election
+| Constant | Value |
+|----------|-------|
+| `LEASE_TTL` | 10 seconds |
+| `HEARTBEAT_INTERVAL` | 5 seconds |
+| Max failover time | ~10 seconds |
 
 ### Graceful Fallback
 
-If etcd is unavailable (e.g., etcd container not started), the coordinator **assumes it is the leader** and continues operating. This is important for development and testing scenarios where etcd might not always be running.
+If etcd is unreachable, the coordinator assumes leadership so the system continues operating. This is logged as a warning.
 
 ---
 
-## 13. Network Partition Simulation with Toxiproxy
+## 11. Network Partition Simulation with Toxiproxy
 
-### What is Toxiproxy?
-
-Toxiproxy is a reverse proxy tool by Shopify. Instead of connecting directly to a service, traffic flows through Toxiproxy. The Toxiproxy admin API allows you to:
-- Disable a proxy (simulates complete network partition — all packets dropped)
-- Add latency to a proxy (simulates slow network)
-- Add packet loss (simulates unreliable network)
-
-### How It is Set Up
+### Architecture
 
 ```
 Without Toxiproxy:
-  Coordinator → participant1:5001 (direct connection)
+  Coordinator → participant1:5001 (direct)
 
 With Toxiproxy:
   Coordinator → toxiproxy:5011 → participant1:5001
 
-Inject partition:
-  Toxiproxy:5011 is DISABLED
+Partition injected:
   Coordinator → toxiproxy:5011 → [CONNECTION DROPPED]
 ```
-
-The three proxy mappings:
 
 | Proxy Name | Toxiproxy Port | Upstream |
 |------------|---------------|----------|
@@ -653,109 +470,33 @@ The three proxy mappings:
 | participant-2 | 5012 | participant2:5002 |
 | participant-3 | 5013 | participant3:5003 |
 
-### Creating a Partition
+### Commands
 
 ```bash
-# Set up proxies (run once after stack starts)
-python3 scripts/inject_partition.py setup
-
-# Partition participant 1 (block all traffic)
-python3 scripts/inject_partition.py 1 on
-
-# Restore participant 1
-python3 scripts/inject_partition.py 1 off
-
-# Add 200ms latency to participant 2
-python3 scripts/inject_partition.py latency 2 200
-
-# Show current proxy states
-python3 scripts/inject_partition.py status
+python3 scripts/inject_partition.py setup        # Create proxies (run once)
+python3 scripts/inject_partition.py 1 on         # Partition participant1
+python3 scripts/inject_partition.py 1 off        # Restore participant1
+python3 scripts/inject_partition.py latency 2 200 # Add 200ms delay to participant2
+python3 scripts/inject_partition.py status        # Show proxy states
 ```
 
-### Why Toxiproxy Instead of Actually Killing a Container?
+### Why Toxiproxy vs. Killing a Container?
 
-Killing a container is too coarse — it stops the entire service. Toxiproxy gives us **selective network control** — the participant process is still running, but network traffic to/from it is blocked. This more accurately simulates a real network partition where a switch or router fails between nodes.
+Killing a container stops the entire service. Toxiproxy gives **selective network control** — the participant process keeps running but its network traffic is blocked. This more accurately simulates a real network partition where a switch or router fails between nodes.
 
 ---
 
-## 14. Automatic Recovery After Coordinator Failure
-
-This is the most important feature of the project. Here is the complete flow:
-
-### Timeline of Coordinator Failure and Recovery
-
-```
-t=0s   Coordinator starts transaction
-t=0s   Participants transition to INIT
-t=1s   Coordinator sends CAN_COMMIT
-t=1s   Participants vote YES → transition to READY
-t=2s   Coordinator sends PRE_COMMIT
-t=2s   Participants ACK → transition to PRE_COMMIT
-t=2s   COORDINATOR CRASHES (process killed or network cut)
-t=4s   Participants notice: no heartbeat for 2 seconds
-t=7s   5-second timeout window expires
-t=7s   HeartbeatMonitor fires _on_coordinator_timeout()
-t=7s   AutoRecovery.attempt_recovery() runs
-
-Recovery process for participant 1:
-  → Check my state: PRE_COMMIT
-  → Query participant 2: GET /query-state/{txn_id} → "PRE_COMMIT"
-  → Query participant 3: GET /query-state/{txn_id} → "PRE_COMMIT"
-  → All reachable peers are in PRE_COMMIT
-  → Decision: COMMIT autonomously
-  → transition(txn_id, "COMMIT", reason="non-blocking recovery")
-  → Save to SQLite
-
-Same happens on participant 2 and participant 3.
-
-Result: All three participants COMMIT without the coordinator.
-```
-
-### What If Only Some Participants Reached PRE_COMMIT?
-
-```
-Participant 1: PRE_COMMIT  (voted YES, got PRE_COMMIT)
-Participant 2: READY       (voted YES, but never got PRE_COMMIT)
-Participant 3: PRE_COMMIT  (voted YES, got PRE_COMMIT)
-
-Participant 1 queries peers:
-  → Participant 2 state: READY
-  → Decision: ABORT (a peer never reached PRE_COMMIT)
-  → transition(txn_id, "ABORT")
-
-Participant 3 also sees READY from participant 2:
-  → Decision: ABORT
-
-Participant 2 is in READY when timeout fires:
-  → AutoRecovery: state is READY, not PRE_COMMIT
-  → Decision: ABORT immediately (no need to ask peers)
-```
-
-All three consistently abort. The system stays consistent.
-
----
-
-## 15. SQLite Persistence
-
-### Why Persistence?
-
-Without saving state to disk, if a participant container crashes and restarts, it loses all memory of in-progress transactions. It would not know it had already voted YES and moved to PRE_COMMIT, so it could not participate in recovery.
-
-Persistence is what makes the system **crash-safe**.
+## 12. SQLite Persistence
 
 ### What Gets Saved
 
 **Participant database** (`data/3pc_participant_N.db`):
 ```
 Table: participant_transactions
-  txn_id         → unique transaction identifier
-  participant_id → which participant (participant_1, participant_2, participant_3)
-  state          → current state (INIT, READY, PRE_COMMIT, COMMIT, ABORT)
-  created_at     → when the transaction was first seen
-  updated_at     → when the state last changed
+  txn_id, participant_id, state, created_at, updated_at
 ```
 
-Every state transition calls `participant_db.save_state()` before returning. The database write happens synchronously inside the state manager.
+Every state transition writes to this table before returning. On restart, `_restore_from_db()` reloads all non-final transactions.
 
 **Coordinator database** (`data/3pc_transactions.db`):
 ```
@@ -773,343 +514,186 @@ Table: transaction_events
 ```
 Participant container restarts
     ↓
-GlobalStateManager.__init__() is called
+GlobalStateManager.__init__()
     ↓
-_restore_from_db() queries: SELECT where state NOT IN ('COMMIT', 'ABORT')
+_restore_from_db(): SELECT where state NOT IN ('COMMIT', 'ABORT')
     ↓
-Loads all pending transactions back into memory
+Pending transactions reloaded into memory
     ↓
-HeartbeatMonitor starts watching
-    ↓
-If coordinator still silent → AutoRecovery resolves pending transactions
+HeartbeatMonitor starts watching for new coordinator heartbeats
 ```
 
 ---
 
-## 16. Thread Safety and Race Condition Fixes
+## 13. Thread Safety
 
-### Why Thread Safety Matters
+Flask handles each HTTP request in a separate thread. Multiple transactions can arrive concurrently. All shared state is protected with explicit locks.
 
-Flask runs each HTTP request in a separate thread. Multiple transactions can arrive at the same time (e.g., 20 concurrent transactions). Without proper locking, two threads could read and write shared data simultaneously and produce inconsistent results.
-
-### Locks Used in This Project
-
-| Location | Lock Type | Protects |
-|----------|-----------|----------|
-| `GlobalStateManager` | `threading.Lock` | `_states` dict (txn_id → state) |
-| `AutoRecovery` | `threading.Lock (non-reentrant)` | Ensures only one recovery runs at a time |
-| `CoordinatorHeartbeat` | `threading.Lock` | `_participants` dict |
-| `HeartbeatMonitor` | `threading.Lock` | `_last_heartbeat`, `_active_transaction` |
-| `LeaderElection` | `threading.Lock` | `is_leader` flag |
-| `coordinator/server.py` | `threading.Lock` | `active_transactions` dict |
-| `ParticipantStore (SQLite)` | `threading.Lock` | All database read/write operations |
-| `TransactionStore (SQLite)` | `threading.Lock` | All database read/write operations |
-
-### Key Race Condition: `all([]) == True` Bug
-
-In Python, `all([])` returns `True` because there are no elements to contradict it. In the original recovery logic, if no peers were configured, the empty list would have made it look like "all peers agree to commit" and the participant would have committed alone — which is incorrect (you cannot safely commit if you do not know what peers decided).
-
-**Fix implemented:**
-
-```python
-# Guard: empty peer list — cannot decide, don't auto-commit
-if not all_values:
-    return "UNKNOWN"
-
-reachable = [s for s in all_values if s != "UNREACHABLE"]
-
-# All peers unreachable — cannot decide
-if not reachable:
-    return "UNKNOWN"
-```
-
-Now the system correctly returns `UNKNOWN` (wait and retry) when it cannot gather enough information.
+| Location | Protects |
+|----------|----------|
+| `GlobalStateManager` — `threading.Lock` | `_states` dict (txn_id → state) |
+| `CoordinatorHeartbeat` — `threading.Lock` | `_participants` dict |
+| `HeartbeatMonitor` — `threading.Lock` | `_last_heartbeat`, `_active_transaction` |
+| `LeaderElection` — `threading.Lock` | `is_leader` flag |
+| `coordinator/server.py` — `threading.Lock` | `active_transactions` dict |
+| `ParticipantStore` — `threading.Lock` | SQLite read/write operations |
+| `TransactionStore` — `threading.Lock` | SQLite read/write operations |
+| `MetricsCollector` — `threading.Lock` | All counter and latency updates |
 
 ---
 
-## 17. Non-Blocking Recovery During Network Partition
-
-### The Classic Blocking Problem (2PC Style)
-
-In 2PC: A participant in state READY (voted YES, waiting for COMMIT/ABORT) is completely blocked if the coordinator dies. It cannot commit (maybe others voted NO) and it cannot abort (maybe coordinator already sent COMMIT).
-
-**Result:** Participant waits forever. Transaction is stuck. Resources are locked.
-
-### How 3PC Solves It (Demonstrated in This Project)
-
-The PRE_COMMIT phase acts as a **safety barrier**. Before sending PRE_COMMIT, the coordinator knows all votes are YES. After receiving PRE_COMMIT, each participant knows the same thing.
-
-This shared knowledge allows participants to coordinate without the coordinator:
-
-```
-Scenario: Coordinator sends PRE_COMMIT to P1, P2, P3 then crashes.
-
-P1 is in PRE_COMMIT → queries P2, P3
-P2 is in PRE_COMMIT → visible to P1 and P3
-P3 is in PRE_COMMIT → visible to P1 and P2
-
-P1 sees: "All my reachable peers are in PRE_COMMIT"
-P1 decides: "Safe to COMMIT" → commits
-
-P2 and P3 do the same independently.
-
-All three COMMIT. Coordinator is not needed.
-```
-
-### Under a Real Network Partition (Toxiproxy)
-
-```
-Network topology with partition:
-  Coordinator  ←→  P1, P2  (can talk)
-  Coordinator  ✗   P3      (partition — Toxiproxy blocks traffic)
-
-Transaction run through proxies:
-  - P1 and P2 reach PRE_COMMIT
-  - P3 is unreachable → coordinator gets NO vote from P3 (connection error)
-  - Coordinator sends ABORT to P1 and P2
-  - Transaction is aborted
-
-When partition heals (Toxiproxy re-enabled):
-  - Next transaction runs normally
-  - All three participants vote YES → PRE_COMMIT → COMMIT
-```
-
-This is verified in the integration tests.
-
----
-
-## 18. Testing Strategy
+## 14. Testing Strategy
 
 ### Unit Tests (No Docker Needed)
 
-Run with:
 ```bash
 make test
-# or
-PYTHONPATH=. python3 tests/test_state.py
-PYTHONPATH=. python3 tests/test_participant_state.py
 ```
 
-These tests verify the state machines in isolation:
+Verifies state machines in isolation:
 - Valid transitions succeed
 - Invalid transitions are rejected
 - Final states (COMMIT, ABORT) cannot transition further
 
 ### Integration Tests (Requires Docker + Toxiproxy)
 
-File: `tests/test_partition_recovery.py`
-
-Run with:
 ```bash
 make up
 python3 scripts/inject_partition.py setup
 pytest tests/test_partition_recovery.py -v
 ```
 
-All tests use `@requires_stack` and `@requires_proxies` decorators, so they automatically skip if Docker is not running. This makes them safe to include in CI pipelines.
-
-### Test Cases Explained
+All tests use `@requires_stack` and `@requires_proxies` decorators and automatically skip if Docker is not running.
 
 | Test | What It Checks |
 |------|---------------|
-| `test_normal_transaction_through_proxy` | Traffic through Toxiproxy works when no partition is active |
-| `test_partition_causes_abort` | Blocking participant1 causes the transaction to abort |
-| `test_restore_partition_resumes_normal_operations` | After healing partition, transactions commit again |
+| `test_normal_transaction_through_proxy` | Traffic through Toxiproxy works with no partition |
+| `test_partition_causes_abort` | Blocking participant1 causes abort |
+| `test_restore_partition_resumes_normal_operations` | After healing, transactions commit again |
 | `test_query_state_endpoint` | `/query-state/<txn_id>` returns valid state after commit |
-| `test_manual_recover_endpoint` | `POST /recover` returns 200 even with no pending transactions |
+| `test_manual_recover_endpoint` | `POST /recover` returns 200 |
 | `test_leader_status` | Coordinator reports `is_leader=True` correctly |
 | `test_concurrent_transactions` | 20 parallel transactions all reach a consistent final state |
-| `test_heartbeat_endpoint` | Each participant accepts heartbeat and returns `{"status": "alive"}` |
-| `test_state_persisted_to_db` | After commit, `/query-state` returns `COMMIT` (from SQLite) |
+| `test_heartbeat_endpoint` | Each participant accepts heartbeat |
+| `test_state_persisted_to_db` | After commit, `/query-state` returns `COMMIT` from SQLite |
 | `test_partition_then_recovery_scenario` | Full scenario: 5 normal → partition → 5 normal |
-
-### Concurrent Transaction Test Detail
-
-```python
-n = 20
-with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-    futures = [pool.submit(run_transaction) for _ in range(n)]
-    results = [f.result() for f in concurrent.futures.as_completed(futures)]
-
-# All 20 must have a valid final status
-for r in results:
-    assert r.get("status") in ("committed", "aborted", "error")
-```
-
-This test verifies that the thread locking mechanisms work correctly under load — no crashes, no inconsistent states, no data corruption from concurrent writes.
 
 ---
 
-
-
-## 19. Architecture Explanation
+## 15. Architecture
 
 ### High-Level Architecture
 
 ```
 +------------------------------------------------------------------+
-|                        Docker Network (3pc-network)              |
+|                    Docker Network (3pc-network)                  |
 |                                                                  |
-|   +----------+     etcd CAS      +---------+                    |
-|   |   etcd   | <---------------> |Coordinator|                  |
-|   | :2379    |                   |  :5000    |                  |
-|   +----------+                   +-----+-----+                  |
-|                                        |                        |
-|                           3PC Protocol | Heartbeats             |
-|                                        |                        |
-|              +-------------------------+------------------------+|
-|              |                         |                        ||
-|   +----------v---+        +------------v-+       +-------------v+|
-|   | Toxiproxy    |        | Toxiproxy    |        | Toxiproxy   ||
-|   | :5011        |        | :5012        |        | :5013       ||
-|   +----------+---+        +----+---------+        +------+------+|
-|              |                 |                         |       |
-|   +----------v---+        +----v---------+       +------v------+|
-|   | Participant 1|        | Participant 2|       | Participant 3||
-|   | :5001        |        | :5002        |       | :5003       ||
-|   | SQLite DB    |        | SQLite DB    |       | SQLite DB   ||
-|   +--------------+        +--------------+       +-------------+|
+|   +----------+    CAS /3pc/leader    +-------------+            |
+|   |   etcd   | <-------------------> | Coordinator-1 :5000 |    |
+|   |  :2379   |                       |  (Leader)   |            |
+|   |          | <-------------------> | Coordinator-2 :5010 |    |
+|   |          |                       |  (Standby)  |            |
+|   |          | <-------------------> | Coordinator-3 :5020 |    |
+|   +----------+                       |  (Standby)  |            |
+|                                      +------+------+            |
+|                                             |                   |
+|                              3PC Protocol + Heartbeats          |
+|                                             |                   |
+|              +------------------------------+------------------+|
+|              |                              |                   ||
+|   +----------v--+          +---------------v-+   +-----------v+||
+|   | Toxiproxy   |          | Toxiproxy       |   | Toxiproxy  |||
+|   |   :5011     |          |   :5012         |   |   :5013    |||
+|   +----------+--+          +------+----------+   +------+-----+||
+|              |                    |                      |      ||
+|   +----------v--+          +------v----------+   +------v-----+||
+|   |Participant 1|          | Participant 2   |   |Participant 3|||
+|   |   :5001     |          |   :5002         |   |   :5003    |||
+|   | SQLite DB   |          | SQLite DB       |   | SQLite DB  |||
+|   +-------------+          +-----------------+   +------------+||
 |                                                                  |
-|   +---------------------+     +------------------------------+  |
-|   | Dashboard  :8000    |     | Toxiproxy Admin  :8474       |  |
-|   | Plotly Charts       |     | partition control API        |  |
-|   +---------------------+     +------------------------------+  |
+|  +--------------------+     +------------------------------+    |
+|  | Dashboard  :8000   |     | Toxiproxy Admin  :8474       |    |
+|  | Flask + Plotly     |     | Partition control API        |    |
+|  +--------------------+     +------------------------------+    |
 +------------------------------------------------------------------+
 ```
 
-### Component Interaction Summary
+### Component Interaction
 
 ```
-User/Client
+Client
     |
     | POST /execute-transaction
     v
-Coordinator
-    | 1. Check is_leader (etcd)
-    | 2. POST /init-transaction (all participants, through Toxiproxy)
-    | 3. POST /message CAN_COMMIT (collect YES/NO votes)
-    | 4. POST /message PRE_COMMIT (collect ACKs)
-    | 5. POST /message DO_COMMIT (final commit)
+Active Coordinator (etcd leader)
+    | 1. Check election.is_leader (returns 503 if not leader)
+    | 2. POST /init-transaction to all participants (through Toxiproxy)
+    | 3. POST /message CAN_COMMIT → collect YES/NO votes
+    | 4. POST /message PRE_COMMIT → collect ACKs
+    | 5. POST /message DO_COMMIT → final commit
     | 6. Save result to SQLite
     | 7. Send heartbeats every 2s (background thread)
     v
-Participants (P1, P2, P3)
-    | Each independently:
-    | - Manages state: INIT→READY→PRE_COMMIT→COMMIT
-    | - Saves every state change to SQLite
-    | - Monitors heartbeat (background thread)
-    | - Triggers AutoRecovery on coordinator silence
-    | - Queries peers at /query-state/<txn_id>
+Participants (P1, P2, P3) — each independently:
+    - Manages state: INIT → READY → PRE_COMMIT → COMMIT/ABORT
+    - Saves every state change to SQLite
+    - Monitors heartbeat (background thread, 5s timeout)
     v
 SQLite databases
-    - coordinator: transaction history + event log
-    - participants: per-participant transaction states
+    - Coordinator: transaction history + event log
+    - Participants: per-participant transaction states
 ```
 
 ---
 
-## 20. How to Run the Project
+## 16. How to Run the Project
 
 ### Prerequisites
 
 - Docker Desktop installed and running
 - Python 3.8+
-- `make` utility (comes with Linux/macOS; Windows users can use Git Bash)
+- `make` utility
 
-### Step 1: Clone and Navigate
+### Start
 
 ```bash
-cd 3PC-Project
+make build      # Build images
+make up         # Start all 9 containers (waits 25s for health)
+make health     # Verify everything is running
+python3 scripts/inject_partition.py setup  # Set up Toxiproxy proxies (once)
+make test-transaction  # Run a transaction
 ```
 
-### Step 2: Build Docker Images
+Open dashboard: `http://localhost:8000`
+
+### Test Leader Failover
 
 ```bash
-make build
+make kill-leader    # Stop coordinator-1
+make test-leader    # coordinator-2 or coordinator-3 should now be leader
+make start-leader   # Bring coordinator-1 back as standby
 ```
 
-This builds the Python application image using the `Dockerfile`. All containers (coordinator, 3 participants, dashboard) use this same image.
-
-### Step 3: Start All Services
+### Test Network Partition
 
 ```bash
-make up
+python3 scripts/inject_partition.py 2 on   # Partition participant2
+make test-transaction                        # Should abort
+python3 scripts/inject_partition.py 2 off  # Restore
+make test-transaction                        # Should commit
 ```
 
-This starts 7 containers:
-- etcd (leader election)
-- toxiproxy (partition simulation)
-- coordinator (port 5000)
-- participant1 (port 5001)
-- participant2 (port 5002)
-- participant3 (port 5003)
-- dashboard (port 8000)
-
-It waits 25 seconds for all services to become healthy.
-
-### Step 4: Verify Everything is Running
+### Stop
 
 ```bash
-make health
-```
-
-Expected output shows all containers healthy, leader status `is_leader=true`, and dashboard responding.
-
-### Step 5: Set Up Toxiproxy Proxies
-
-```bash
-python3 scripts/inject_partition.py setup
-```
-
-This creates the three proxies in Toxiproxy. Must be done once after `make up`.
-
-### Step 6: Run a Transaction
-
-```bash
-make test-transaction
-```
-
-### Step 7: Open Dashboard
-
-Open browser: `http://localhost:8000`
-
-### Step 8: Run Integration Tests
-
-```bash
-pytest tests/test_partition_recovery.py -v
-```
-
-### Step 9: Inject a Partition
-
-```bash
-# Block participant 1
-python3 scripts/inject_partition.py 1 on
-
-# Try a transaction (should abort)
-make test-transaction
-
-# Restore participant 1
-python3 scripts/inject_partition.py 1 off
-
-# Transaction should succeed again
-make test-transaction
-```
-
-### Step 10: Stop Everything
-
-```bash
-make down
-```
-
-### Full Cleanup (removes images and databases)
-
-```bash
-make clean
+make down    # Stop all services
+make clean   # Stop + remove volumes and images
 ```
 
 ---
 
-## 21. Example Commands and Expected Outputs
+## 17. Example Commands and Expected Outputs
 
 ### Health Check
 
@@ -1119,25 +703,22 @@ $ make health
 FULL SYSTEM HEALTH CHECK
 ======================================
 
-1. Docker Containers:
-Name                   State   Ports
-3pc-etcd               Up      0.0.0.0:2379->2379/tcp
-3pc-toxiproxy          Up      0.0.0.0:8474->8474/tcp
-3pc-coordinator        Up      0.0.0.0:5000->5000/tcp
-3pc-participant1       Up      0.0.0.0:5001->5001/tcp
-3pc-participant2       Up      0.0.0.0:5002->5002/tcp
-3pc-participant3       Up      0.0.0.0:5003->5003/tcp
-3pc-dashboard          Up      0.0.0.0:8000->8000/tcp
+Docker Containers:
+3pc-etcd               Up   0.0.0.0:2379->2379/tcp
+3pc-toxiproxy          Up   0.0.0.0:8474->8474/tcp
+3pc-coordinator        Up   0.0.0.0:5000->5000/tcp
+3pc-coordinator-2      Up   0.0.0.0:5010->5010/tcp
+3pc-coordinator-3      Up   0.0.0.0:5020->5020/tcp
+3pc-participant1       Up   0.0.0.0:5001->5001/tcp
+3pc-participant2       Up   0.0.0.0:5002->5002/tcp
+3pc-participant3       Up   0.0.0.0:5003->5003/tcp
+3pc-dashboard          Up   0.0.0.0:8000->8000/tcp
 
-2. etcd Status:
+etcd Status:
 http://localhost:2379 is healthy
 
-3. Leader Status:
-{
-    "is_leader": true,
-    "node_id": "coordinator-1",
-    "current_leader": "coordinator-1"
-}
+Leader Status:
+{ "is_leader": true, "node_id": "coordinator-1", "current_leader": "coordinator-1" }
 ```
 
 ---
@@ -1146,139 +727,91 @@ http://localhost:2379 is healthy
 
 ```bash
 $ make test-transaction
-
-Sending 1 test transaction...
 {
     "status": "committed",
-    "transaction_id": "txn-20240101-abc123",
+    "transaction_id": "txn-abc123",
     "final_state": "COMMIT",
     "state_history": ["WAIT", "PRE_COMMIT", "COMMIT"],
     "participants": 3,
-    "votes": {
-        "http://toxiproxy-server:5011": "YES",
-        "http://toxiproxy-server:5012": "YES",
-        "http://toxiproxy-server:5013": "YES"
-    },
-    "acks": {
-        "http://toxiproxy-server:5011": "ACK",
-        "http://toxiproxy-server:5012": "ACK",
-        "http://toxiproxy-server:5013": "ACK"
-    },
-    "commits": {
-        "http://toxiproxy-server:5011": "COMMITTED",
-        "http://toxiproxy-server:5012": "COMMITTED",
-        "http://toxiproxy-server:5013": "COMMITTED"
-    }
+    "votes":   { "...5011": "YES",  "...5012": "YES",  "...5013": "YES" },
+    "acks":    { "...5011": "ACK",  "...5012": "ACK",  "...5013": "ACK" },
+    "commits": { "...5011": "COMMITTED", "...5012": "COMMITTED", "...5013": "COMMITTED" }
 }
 ```
 
 ---
 
-### Transaction with Partition Injected
+### Transaction with Partition
 
 ```bash
 $ python3 scripts/inject_partition.py 1 on
-[OK]  participant1: PARTITIONED  (traffic blocked)
+[OK]  participant1: PARTITIONED
 
 $ make test-transaction
 {
     "status": "aborted",
-    "transaction_id": "txn-20240101-def456",
     "final_state": "ABORT",
     "reason": "One or more participants voted NO",
-    "votes": {
-        "http://toxiproxy-server:5011": "NO",
-        "http://toxiproxy-server:5012": "YES",
-        "http://toxiproxy-server:5013": "YES"
-    }
+    "votes": { "...5011": "NO", "...5012": "YES", "...5013": "YES" }
 }
 
 $ python3 scripts/inject_partition.py 1 off
-[OK]  participant1: RESTORED     (traffic flowing)
+[OK]  participant1: RESTORED
 ```
 
 ---
 
-### Toxiproxy Proxy Status
+### Leader Failover
 
 ```bash
-$ python3 scripts/inject_partition.py status
+$ make kill-leader
+coordinator-1 stopped. A new leader should be elected within ~10s.
 
-Proxy                Listen             Upstream                   Status
-------------------------------------------------------------------------
-participant-1        0.0.0.0:5011       participant1:5001          OK
-participant-2        0.0.0.0:5012       participant2:5002          PARTITIONED
-participant-3        0.0.0.0:5013       participant3:5003          OK
+$ make test-leader    # After ~10 seconds
+coordinator-1 (port 5000):  not responding
+coordinator-2 (port 5010):  { "is_leader": true, "node_id": "coordinator-2" }
+coordinator-3 (port 5020):  { "is_leader": false, "node_id": "coordinator-3" }
+
+$ make start-leader
+coordinator-1 started. It will rejoin as standby.
 ```
 
 ---
 
----
-
-### Leader Election Verification
-
-```bash
-$ make test-etcd
-
-Checking who holds the etcd leader lock...
-/3pc/leader
-coordinator-1
-
-$ make test-leader
-{
-    "is_leader": true,
-    "node_id": "coordinator-1",
-    "current_leader": "coordinator-1"
-}
-```
-
----
-
-### 22 Transaction Load Test
+### Load Test
 
 ```bash
 $ make run-txns
-
-Running 20 transactions...
-Transaction 1
-Transaction 2
+Running 10 transactions...
+✓ Transaction 1
+✓ Transaction 2
 ...
-Transaction 20
-
-All 20 transactions completed!
-Check dashboard: http://localhost:8000
+✓ Transaction 10
 
 $ make metrics
-Total: 20, Committed: 20, Success Rate: 100.0%
+Total: 10, Committed: 10, Success Rate: 100.0%
 ```
 
 ---
 
-## 23. Conclusion
+## 18. Conclusion
 
-This project successfully implements the Three-Phase Commit (3PC) protocol with all its key properties demonstrated in a working, containerized system.
+This project implements the Three-Phase Commit protocol with production-grade high availability features in a fully containerized system.
 
 ### What Was Built
 
-A complete distributed transaction system with:
-- The full 3PC protocol (CAN_COMMIT, PRE_COMMIT, DO_COMMIT) over HTTP/REST
-- Automatic coordinator failure detection via heartbeat monitoring
-- Non-blocking autonomous recovery using peer-state consensus (Skeen 1981 rules)
+- Full 3PC protocol (CAN_COMMIT → PRE_COMMIT → DO_COMMIT) over HTTP/REST
+- Three-coordinator cluster with etcd-based leader election and automatic failover
 - Network partition simulation using Toxiproxy
-- SQLite-based state persistence for crash recovery
-- etcd-based distributed leader election
-- Thread-safe concurrent transaction handling
-- A live metrics dashboard
-- A comprehensive integration test suite
-
+- SQLite state persistence for crash recovery
+- Thread-safe concurrent transaction handling with explicit locks
+- Live metrics dashboard using Flask and Plotly
+- Comprehensive integration test suite with concurrent transaction tests
 
 ### Key Takeaways
 
-1. **3PC's non-blocking advantage over 2PC comes from the PRE_COMMIT phase** — it creates a safe window where all participants know everyone voted YES
-2. **The cost of non-blocking is one extra communication round** — 3 round-trips instead of 2
-3. **Persistence is essential for recovery** — without SQLite, a restarted participant cannot know its pre-crash state
-4. **Thread safety is non-trivial in distributed systems** — every shared data structure needs explicit locking
-5. **Graceful degradation matters** — if etcd is down, the system continues working by falling back to assuming leadership
-
----
-
+1. **3PC's non-blocking advantage comes from PRE_COMMIT** — it creates a safe window where all participants know every peer voted YES, allowing the new coordinator to resume safely
+2. **etcd leader election enables automatic failover** — coordinator failure is tolerated with ≤10 seconds downtime, no manual restart needed
+3. **Persistence is essential for recovery** — without SQLite, a restarted participant cannot know its pre-crash state and cannot participate in coordinator-led recovery
+4. **Thread safety is non-trivial** — every shared data structure requires explicit locking under concurrent Flask requests
+5. **Graceful degradation matters** — if etcd is down, coordinators fall back to assuming leadership so transactions are never blocked by infrastructure failure
