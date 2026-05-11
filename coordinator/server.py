@@ -11,6 +11,7 @@ from coordinator.messages import Message, MessageType, create_transaction_id
 from coordinator.leader_election import LeaderElection
 from coordinator.heartbeat import CoordinatorHeartbeat
 import requests
+import os
 import threading
 from typing import List, Dict
 import time
@@ -23,12 +24,14 @@ logger = structlog.get_logger()
 # Create Flask app
 app = Flask(__name__)
 
+_NODE_ID = os.environ.get('NODE_ID', 'coordinator-1')
+
 # Leader election — only the leader executes transactions
-election = LeaderElection(node_id='coordinator-1')
+election = LeaderElection(node_id=_NODE_ID)
 election.try_become_leader()
 
 # Heartbeat sender — keeps participants' timeout clocks from firing
-coordinator_heartbeat = CoordinatorHeartbeat(coordinator_id='coordinator-1')
+coordinator_heartbeat = CoordinatorHeartbeat(coordinator_id=_NODE_ID)
 
 # Active transactions — protected by a lock for thread safety
 active_transactions: Dict = {}
@@ -170,6 +173,7 @@ def execute_transaction():
             transaction_id=txn_id,
             error=str(e)
         )
+        metrics.record_abort(txn_id)
         return jsonify({
             "status": "error",
             "transaction_id": txn_id,

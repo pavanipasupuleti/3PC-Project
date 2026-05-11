@@ -38,7 +38,6 @@ def _empty_metrics():
             "phase1_data": [], "phase2_data": [], "phase3_data": []
         },
         "failures": {"partitions": 0, "timeouts": 0},
-        "recovery": {"count": 0},
         "state_transitions": {},
         "timeline": []
     }

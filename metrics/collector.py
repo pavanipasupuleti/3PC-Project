@@ -18,8 +18,6 @@ class MetricsCollector:
         self.transaction_count = 0
         self.commit_count = 0
         self.abort_count = 0
-        self.recovery_count = 0
-        
         # Latencies (ms) - store last 100
         self.phase1_latencies = []
         self.phase2_latencies = []
@@ -64,10 +62,6 @@ class MetricsCollector:
             for t in self.transaction_timeline:
                 if t['txn_id'] == txn_id:
                     t['outcome'] = 'abort'
-    
-    def record_recovery(self):
-        with self.lock:
-            self.recovery_count += 1
     
     def record_phase_latency(self, phase: int, latency_ms: float):
         with self.lock:
@@ -127,9 +121,6 @@ class MetricsCollector:
                 "failures": {
                     "partitions": self.partition_count,
                     "timeouts": self.timeout_count
-                },
-                "recovery": {
-                    "count": self.recovery_count
                 },
                 "state_transitions": dict(self.state_transitions),
                 "timeline": self.transaction_timeline[-20:]  # Last 20
