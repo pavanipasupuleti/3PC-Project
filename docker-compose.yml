@@ -1,13 +1,11 @@
-version: '3.8'
-
 services:
-
   # ----------------------------------------------------------------
   # etcd — distributed leader election
   # ----------------------------------------------------------------
   etcd:
     image: quay.io/coreos/etcd:v3.5.0
     container_name: 3pc-etcd
+
     environment:
       - ETCD_NAME=etcd0
       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
@@ -17,10 +15,15 @@ services:
       - ETCD_INITIAL_CLUSTER=etcd0=http://etcd:2380
       - ETCD_INITIAL_CLUSTER_TOKEN=3pc-etcd-cluster
       - ETCD_INITIAL_CLUSTER_STATE=new
+
     ports:
       - "2379:2379"
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 10s
@@ -34,13 +37,18 @@ services:
   toxiproxy-server:
     image: shopify/toxiproxy:latest
     container_name: 3pc-toxiproxy
+
     ports:
-      - "8474:8474"   # Admin API
-      - "5011:5011"   # Proxy → participant1
-      - "5012:5012"   # Proxy → participant2
-      - "5013:5013"   # Proxy → participant3
+      - "8474:8474"
+      - "5011:5011"
+      - "5012:5012"
+      - "5013:5013"
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8474/api/version"]
       interval: 5s
@@ -49,26 +57,38 @@ services:
       start_period: 5s
 
   # ----------------------------------------------------------------
-  # coordinators — only the etcd leader processes transactions
+  # coordinator-1
   # ----------------------------------------------------------------
   coordinator:
     build: .
     container_name: 3pc-coordinator
-    command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5000)"
+
+    command: >
+      python3 -c
+      "from coordinator.server import run_coordinator;
+      run_coordinator(host='0.0.0.0', port=5000)"
+
     ports:
       - "5000:5000"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
-      - FLASK_ENV=development
+      - FLASK_ENV=production
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - NODE_ID=coordinator-1
+
     depends_on:
       etcd:
         condition: service_healthy
+
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=5)"]
       interval: 10s
@@ -76,24 +96,39 @@ services:
       retries: 3
       start_period: 15s
 
+  # ----------------------------------------------------------------
+  # coordinator-2
+  # ----------------------------------------------------------------
   coordinator-2:
     build: .
     container_name: 3pc-coordinator-2
-    command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5010)"
+
+    command: >
+      python3 -c
+      "from coordinator.server import run_coordinator;
+      run_coordinator(host='0.0.0.0', port=5010)"
+
     ports:
       - "5010:5010"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
-      - FLASK_ENV=development
+      - FLASK_ENV=production
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - NODE_ID=coordinator-2
+
     depends_on:
       etcd:
         condition: service_healthy
+
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5010/health', timeout=5)"]
       interval: 10s
@@ -101,24 +136,39 @@ services:
       retries: 3
       start_period: 15s
 
+  # ----------------------------------------------------------------
+  # coordinator-3
+  # ----------------------------------------------------------------
   coordinator-3:
     build: .
     container_name: 3pc-coordinator-3
-    command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5020)"
+
+    command: >
+      python3 -c
+      "from coordinator.server import run_coordinator;
+      run_coordinator(host='0.0.0.0', port=5020)"
+
     ports:
       - "5020:5020"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
-      - FLASK_ENV=development
+      - FLASK_ENV=production
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - NODE_ID=coordinator-3
+
     depends_on:
       etcd:
         condition: service_healthy
+
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5020/health', timeout=5)"]
       interval: 10s
@@ -127,58 +177,95 @@ services:
       start_period: 15s
 
   # ----------------------------------------------------------------
-  # participants — route through toxiproxy so partitions can be injected
+  # participant-1
   # ----------------------------------------------------------------
   participant1:
     build: .
     container_name: 3pc-participant1
-    command: python3 -c "from participant.server import run_participant; run_participant('participant_1', host='0.0.0.0', port=5001)"
+
+    command: >
+      python3 -c
+      "from participant.server import run_participant;
+      run_participant('participant_1', host='0.0.0.0', port=5001)"
+
     ports:
       - "5001:5001"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
-      # Peers are addressed through toxiproxy so partitions affect
-      # both coordinator→participant and participant→participant traffic
       - PARTICIPANT_PEERS=["http://toxiproxy-server:5012","http://toxiproxy-server:5013"]
       - HEARTBEAT_TIMEOUT=5
       - PARTICIPANT_DB_PATH=data/3pc_participant_1.db
+
     depends_on:
       - coordinator
 
+  # ----------------------------------------------------------------
+  # participant-2
+  # ----------------------------------------------------------------
   participant2:
     build: .
     container_name: 3pc-participant2
-    command: python3 -c "from participant.server import run_participant; run_participant('participant_2', host='0.0.0.0', port=5002)"
+
+    command: >
+      python3 -c
+      "from participant.server import run_participant;
+      run_participant('participant_2', host='0.0.0.0', port=5002)"
+
     ports:
       - "5002:5002"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
       - PARTICIPANT_PEERS=["http://toxiproxy-server:5011","http://toxiproxy-server:5013"]
       - HEARTBEAT_TIMEOUT=5
       - PARTICIPANT_DB_PATH=data/3pc_participant_2.db
+
     depends_on:
       - coordinator
 
+  # ----------------------------------------------------------------
+  # participant-3
+  # ----------------------------------------------------------------
   participant3:
     build: .
     container_name: 3pc-participant3
-    command: python3 -c "from participant.server import run_participant; run_participant('participant_3', host='0.0.0.0', port=5003)"
+
+    command: >
+      python3 -c
+      "from participant.server import run_participant;
+      run_participant('participant_3', host='0.0.0.0', port=5003)"
+
     ports:
       - "5003:5003"
+
     volumes:
       - ./data:/app/data
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     environment:
       - PARTICIPANT_PEERS=["http://toxiproxy-server:5011","http://toxiproxy-server:5012"]
       - HEARTBEAT_TIMEOUT=5
       - PARTICIPANT_DB_PATH=data/3pc_participant_3.db
+
     depends_on:
       - coordinator
 
@@ -188,14 +275,236 @@ services:
   dashboard:
     build: .
     container_name: 3pc-dashboard
-    command: python3 -c "from dashboard.app import run_dashboard; run_dashboard()"
+
+    command: >
+      python3 -c
+      "from dashboard.app import run_dashboard;
+      run_dashboard()"
+
     ports:
       - "8000:8000"
+
     networks:
       - 3pc-network
+
+    restart: unless-stopped
+
     depends_on:
       - coordinator
 
 networks:
   3pc-network:
     driver: bridge
+
+
+
+
+
+
+
+
+
+
+
+
+# version: '3.8'
+
+# services:
+
+#   # ----------------------------------------------------------------
+#   # etcd — distributed leader election
+#   # ----------------------------------------------------------------
+#   etcd:
+#     image: quay.io/coreos/etcd:v3.5.0
+#     container_name: 3pc-etcd
+#     environment:
+#       - ETCD_NAME=etcd0
+#       - ETCD_ADVERTISE_CLIENT_URLS=http://etcd:2379
+#       - ETCD_LISTEN_CLIENT_URLS=http://0.0.0.0:2379
+#       - ETCD_INITIAL_ADVERTISE_PEER_URLS=http://etcd:2380
+#       - ETCD_LISTEN_PEER_URLS=http://0.0.0.0:2380
+#       - ETCD_INITIAL_CLUSTER=etcd0=http://etcd:2380
+#       - ETCD_INITIAL_CLUSTER_TOKEN=3pc-etcd-cluster
+#       - ETCD_INITIAL_CLUSTER_STATE=new
+#     ports:
+#       - "2379:2379"
+#     networks:
+#       - 3pc-network
+#     healthcheck:
+#       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+#       start_period: 10s
+
+#   # ----------------------------------------------------------------
+#   # toxiproxy — network fault injection
+#   # ----------------------------------------------------------------
+#   toxiproxy-server:
+#     image: shopify/toxiproxy:latest
+#     container_name: 3pc-toxiproxy
+#     ports:
+#       - "8474:8474"   # Admin API
+#       - "5011:5011"   # Proxy → participant1
+#       - "5012:5012"   # Proxy → participant2
+#       - "5013:5013"   # Proxy → participant3
+#     networks:
+#       - 3pc-network
+#     healthcheck:
+#       test: ["CMD", "wget", "-qO-", "http://localhost:8474/api/version"]
+#       interval: 5s
+#       timeout: 3s
+#       retries: 5
+#       start_period: 5s
+
+#   # ----------------------------------------------------------------
+#   # coordinators — only the etcd leader processes transactions
+#   # ----------------------------------------------------------------
+#   coordinator:
+#     build: .
+#     container_name: 3pc-coordinator
+#     command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5000)"
+#     ports:
+#       - "5000:5000"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       - FLASK_ENV=development
+#       - ETCD_HOST=etcd
+#       - ETCD_PORT=2379
+#       - NODE_ID=coordinator-1
+#     depends_on:
+#       etcd:
+#         condition: service_healthy
+#     healthcheck:
+#       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/health', timeout=5)"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 3
+#       start_period: 15s
+
+#   coordinator-2:
+#     build: .
+#     container_name: 3pc-coordinator-2
+#     command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5010)"
+#     ports:
+#       - "5010:5010"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       - FLASK_ENV=development
+#       - ETCD_HOST=etcd
+#       - ETCD_PORT=2379
+#       - NODE_ID=coordinator-2
+#     depends_on:
+#       etcd:
+#         condition: service_healthy
+#     healthcheck:
+#       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5010/health', timeout=5)"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 3
+#       start_period: 15s
+
+#   coordinator-3:
+#     build: .
+#     container_name: 3pc-coordinator-3
+#     command: python3 -c "from coordinator.server import run_coordinator; run_coordinator(host='0.0.0.0', port=5020)"
+#     ports:
+#       - "5020:5020"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       - FLASK_ENV=development
+#       - ETCD_HOST=etcd
+#       - ETCD_PORT=2379
+#       - NODE_ID=coordinator-3
+#     depends_on:
+#       etcd:
+#         condition: service_healthy
+#     healthcheck:
+#       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5020/health', timeout=5)"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 3
+#       start_period: 15s
+
+#   # ----------------------------------------------------------------
+#   # participants — route through toxiproxy so partitions can be injected
+#   # ----------------------------------------------------------------
+#   participant1:
+#     build: .
+#     container_name: 3pc-participant1
+#     command: python3 -c "from participant.server import run_participant; run_participant('participant_1', host='0.0.0.0', port=5001)"
+#     ports:
+#       - "5001:5001"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       # Peers are addressed through toxiproxy so partitions affect
+#       # both coordinator→participant and participant→participant traffic
+#       - PARTICIPANT_PEERS=["http://toxiproxy-server:5012","http://toxiproxy-server:5013"]
+#       - HEARTBEAT_TIMEOUT=5
+#       - PARTICIPANT_DB_PATH=data/3pc_participant_1.db
+#     depends_on:
+#       - coordinator
+
+#   participant2:
+#     build: .
+#     container_name: 3pc-participant2
+#     command: python3 -c "from participant.server import run_participant; run_participant('participant_2', host='0.0.0.0', port=5002)"
+#     ports:
+#       - "5002:5002"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       - PARTICIPANT_PEERS=["http://toxiproxy-server:5011","http://toxiproxy-server:5013"]
+#       - HEARTBEAT_TIMEOUT=5
+#       - PARTICIPANT_DB_PATH=data/3pc_participant_2.db
+#     depends_on:
+#       - coordinator
+
+#   participant3:
+#     build: .
+#     container_name: 3pc-participant3
+#     command: python3 -c "from participant.server import run_participant; run_participant('participant_3', host='0.0.0.0', port=5003)"
+#     ports:
+#       - "5003:5003"
+#     volumes:
+#       - ./data:/app/data
+#     networks:
+#       - 3pc-network
+#     environment:
+#       - PARTICIPANT_PEERS=["http://toxiproxy-server:5011","http://toxiproxy-server:5012"]
+#       - HEARTBEAT_TIMEOUT=5
+#       - PARTICIPANT_DB_PATH=data/3pc_participant_3.db
+#     depends_on:
+#       - coordinator
+
+#   # ----------------------------------------------------------------
+#   # dashboard
+#   # ----------------------------------------------------------------
+#   dashboard:
+#     build: .
+#     container_name: 3pc-dashboard
+#     command: python3 -c "from dashboard.app import run_dashboard; run_dashboard()"
+#     ports:
+#       - "8000:8000"
+#     networks:
+#       - 3pc-network
+#     depends_on:
+#       - coordinator
+
+# networks:
+#   3pc-network:
+#     driver: bridge

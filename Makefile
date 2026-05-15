@@ -111,26 +111,46 @@ test-etcd:
 	@docker exec 3pc-etcd etcdctl --endpoints=http://localhost:2379 get /3pc/leader 2>/dev/null || echo "⚠️  etcd not running"
 	@echo ""
 
+# test-transaction:
+# 	@echo "Sending 1 test transaction..."
+# 	@curl -s -X POST http://localhost:5000/execute-transaction \
+# 		-H "Content-Type: application/json" \
+# 		-d '{"participants": ["http://localhost:5011", "http://localhost:5012", "http://localhost:5013"]}' \
+# 		| python3 -m json.tool
+# 	@echo ""
 test-transaction:
 	@echo "Sending 1 test transaction..."
 	@curl -s -X POST http://localhost:5000/execute-transaction \
 		-H "Content-Type: application/json" \
-		-d '{"participants": ["http://participant1:5001", "http://participant2:5002", "http://participant3:5003"]}' \
+		-d '{"participants": ["http://toxiproxy-server:5011", "http://toxiproxy-server:5012", "http://toxiproxy-server:5013"]}' \
 		| python3 -m json.tool
 	@echo ""
-
 metrics:
 	@echo " Current metrics from dashboard:"
 	@curl -s http://localhost:8000/api/metrics | python3 -c "import sys, json; d=json.load(sys.stdin); print(f'Total: {d[\"transactions\"][\"total\"]}, Committed: {d[\"transactions\"][\"committed\"]}, Success Rate: {d[\"transactions\"][\"commit_rate\"]}%')" 2>/dev/null || echo "⚠️  Dashboard not responding"
 	@echo ""
 
+# run-txns:
+# 	@echo " Running 10 transactions..."
+# 	@for i in {1..10}; do \
+# 		curl -s -X POST http://localhost:5000/execute-transaction \
+# 			-H "Content-Type: application/json" \
+# 			-d '{"participants": ["http://localhost:5011", "http://localhost:5012", "http://localhost:5013"]}' \
+# 			| python3 -m json.tool; \
+# 		echo "✓ Transaction $$i"; \
+# 		sleep 0.3; \
+# 	done
+# 	@echo ""
+# 	@echo " All 10 transactions completed!"
+# 	@echo "Check dashboard: http://localhost:8000"
+# 	@echo ""
 run-txns:
 	@echo " Running 10 transactions..."
 	@for i in {1..10}; do \
 		curl -s -X POST http://localhost:5000/execute-transaction \
 			-H "Content-Type: application/json" \
-			-d '{"participants": ["http://participant1:5001", "http://participant2:5002", "http://participant3:5003"]}' \
-			> /dev/null; \
+			-d '{"participants": ["http://toxiproxy-server:5011", "http://toxiproxy-server:5012", "http://toxiproxy-server:5013"]}' \
+			| python3 -m json.tool; \
 		echo "✓ Transaction $$i"; \
 		sleep 0.3; \
 	done
